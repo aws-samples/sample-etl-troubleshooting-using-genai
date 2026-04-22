@@ -1,0 +1,82 @@
+{
+  "_comment": "OpenSearch alerting monitor: triggers when the count of log_level=ERROR events exceeds a configurable threshold within a rolling time window. Apply via POST /_plugins/_alerting/monitors. Replace SNS_TOPIC_ARN and ACCOUNT_ID with real values.",
+  "type": "monitor",
+  "name": "ETL Pipeline Error Rate Monitor",
+  "enabled": true,
+  "schedule": {
+    "period": {
+      "interval": 5,
+      "unit": "MINUTES"
+    }
+  },
+  "inputs": [
+    {
+      "search": {
+        "indices": ["etl-logs-*"],
+        "query": {
+          "size": 0,
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "log_level": "ERROR" } },
+                {
+                  "range": {
+                    "timestamp": {
+                      "gte": "{{period_start}}",
+                      "lte": "{{period_end}}",
+                      "format": "epoch_millis"
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "aggs": {
+            "error_count": {
+              "value_count": {
+                "field": "log_level"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "triggers": [
+    {
+      "name": "High Error Count",
+      "severity": "1",
+      "condition": {
+        "script": {
+          "source": "ctx.results[0].aggregations.error_count.value > 5",
+          "lang": "painless"
+        }
+      },
+      "actions": [
+        {
+          "name": "Notify SNS",
+          "destination_id": "sns-destination-placeholder",
+          "message_template": {
+            "source": "Monitor '{{ctx.monitor.name}}' triggered: {{ctx.results[0].aggregations.error_count.value}} ERROR events detected in the last {{ctx.monitor.schedule.period.interval}} minutes. Run IDs affected: check index etl-logs-* for details.",
+            "lang": "mustache"
+          },
+          "throttle_enabled": true,
+          "throttle": {
+            "value": 10,
+            "unit": "MINUTES"
+          }
+        }
+      ]
+    }
+  ],
+  "destinations": [
+    {
+      "name": "ETL Failures SNS Topic",
+      "type": "sns",
+      "sns": {
+        "topic_arn": "arn:aws:sns:us-east-1:ACCOUNT_ID:etl-failures",
+        "role_arn": "arn:aws:iam::ACCOUNT_ID:role/OpenSearchAlertingRole"
+      }
+    }
+  ]
+}

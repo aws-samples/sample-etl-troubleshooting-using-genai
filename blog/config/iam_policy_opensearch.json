@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowOpenSearchETLLogsWrite",
+      "Effect": "Allow",
+      "Action": [
+        "es:ESHttpPost"
+      ],
+      "Resource": "arn:aws:es:REGION:ACCOUNT_ID:domain/DOMAIN_NAME/etl-logs-*"
+    }
+  ]
+}
