@@ -1,6 +1,27 @@
 # Implementation Guide: MWAA + OpenSearch Monitoring Solution
 
-This guide walks through the concrete steps to deploy the monitoring solution described in the blog post. Follow the steps in order — each phase builds on the previous one.
+This guide reflects the actual deployment steps used to stand up the solution in AWS account `172542676092` (us-east-1). It includes real-world fixes discovered during deployment.
+
+---
+
+## Deployed Resources (Reference)
+
+| Resource | Name / ARN |
+|---|---|
+| OpenSearch Domain | `etl-monitoring` — `search-etl-monitoring-mz7zpvh76up33iejfbl7ock3oq.us-east-1.es.amazonaws.com` |
+| OpenSearch Index | `etl-logs-2026-04` |
+| ISM Retention Policy | `etl-logs-retention` (30-day) |
+| OpenSearch Alert Monitor | `ETL Pipeline Error Rate Monitor` |
+| SNS Notification Channel | `ETL Failures SNS Topic` |
+| SNS Topic | `arn:aws:sns:us-east-1:172542676092:etl-failures` |
+| Secrets Manager Secret | `etl/opensearch/endpoint` |
+| S3 Bucket | `mwaa-etl-monitoring-172542676092` |
+| MWAA Environment | `etl-monitoring-mwaa` (Airflow 2.9.2, PUBLIC_ONLY) |
+| IAM Role | `MWAAExecutionRole` |
+| IAM Role | `OpenSearchAlertingRole` |
+| Private Subnets | `subnet-0029d8c9c07af1507` (us-east-1a), `subnet-0bd713831826f72fe` (us-east-1b) |
+| NAT Gateway | `nat-08c30eb68d0fc97f3` |
+| OpenSearch Dashboard | `ETL Pipeline Monitoring` |
 
 ---
 
@@ -36,122 +57,93 @@ cd MWAA_Observability_Blog
 
 ## Phase 2: IAM Setup
 
-### Step 2.1 — Create or update the four compute IAM roles
-
-Each of the following roles needs the OpenSearch write permission below. Attach it as an inline or managed policy.
-
-| Role | Used by |
-|---|---|
-| `MWAAExecutionRole` | MWAA environment |
-| `GlueServiceRole` | AWS Glue job |
-| `LambdaExecutionRole` | Lambda function |
-| `EC2InstanceProfile` | EC2 instance |
-
-Apply `blog/config/iam_policy_opensearch.json` to each role, replacing the placeholder values:
+### Step 2.1 — Create the MWAAExecutionRole
 
 ```bash
-# Replace REGION, ACCOUNT_ID, DOMAIN_NAME with your values
+aws iam create-role \
+  --role-name MWAAExecutionRole \
+  --assume-role-policy-document file://infra/mwaa-trust-policy.json \
+  --description "MWAA execution role for ETL monitoring pipeline"
+
 aws iam put-role-policy \
   --role-name MWAAExecutionRole \
-  --policy-name OpenSearchETLLogsWrite \
-  --policy-document file://blog/config/iam_policy_opensearch.json
+  --policy-name MWAAExecutionPolicy \
+  --policy-document file://infra/mwaa-execution-policy.json
 ```
 
-Repeat for `GlueServiceRole`, `LambdaExecutionRole`, and `EC2InstanceProfile`.
+The `infra/mwaa-execution-policy.json` grants:
+- `airflow:PublishMetrics` on the MWAA environment
+- `s3:GetObject*`, `s3:List*` on the MWAA S3 bucket
+- `logs:*` on Airflow log groups
+- `cloudwatch:PutMetricData`
+- `sqs:*` on Airflow Celery queues
+- `es:ESHttpPost` on `etl-logs-*` index
+- `secretsmanager:GetSecretValue` on `etl/opensearch/*`
+- `sns:Publish` on the `etl-failures` topic
 
-### Step 2.2 — Add Secrets Manager permission to MWAAExecutionRole
-
-```bash
-aws iam put-role-policy \
-  --role-name MWAAExecutionRole \
-  --policy-name SecretsManagerRead \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Action": ["secretsmanager:GetSecretValue"],
-      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:etl/opensearch/*"
-    }]
-  }'
-```
-
-### Step 2.3 — Add SNS publish permission to MWAAExecutionRole
+### Step 2.2 — Create the OpenSearchAlertingRole
 
 ```bash
+aws iam create-role \
+  --role-name OpenSearchAlertingRole \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"es.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
 aws iam put-role-policy \
-  --role-name MWAAExecutionRole \
-  --policy-name SNSFailureNotify \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Action": ["sns:Publish"],
-      "Resource": "arn:aws:sns:REGION:ACCOUNT_ID:etl-failures"
-    }]
-  }'
+  --role-name OpenSearchAlertingRole \
+  --policy-name SNSPublishPolicy \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sns:Publish","Resource":"arn:aws:sns:REGION:ACCOUNT_ID:etl-failures"}]}'
 ```
 
 ---
 
 ## Phase 3: AWS Infrastructure
 
-### Step 3.1 — Create the SNS topic for failure notifications
+### Step 3.1 — Create the SNS topic
 
 ```bash
-aws sns create-topic --name etl-failures
-# Note the TopicArn in the output — you'll need it in later steps
+aws sns create-topic --name etl-failures --region us-east-1
 ```
 
-Subscribe your email or PagerDuty endpoint:
+Subscribe your email:
 
 ```bash
 aws sns subscribe \
-  --topic-arn arn:aws:sns:REGION:ACCOUNT_ID:etl-failures \
+  --topic-arn arn:aws:sns:us-east-1:ACCOUNT_ID:etl-failures \
   --protocol email \
   --notification-endpoint your@email.com
 ```
 
-### Step 3.2 — Create the Amazon OpenSearch Service domain
+### Step 3.2 — Create the OpenSearch domain
 
-If you don't have an existing domain, create one. Minimum recommended configuration:
+> **Note:** The access policy must be passed as a single-line JSON string (no newlines) to avoid a ValidationException.
 
 ```bash
 aws opensearch create-domain \
   --domain-name etl-monitoring \
-  --engine-version OpenSearch_2.11 \
-  --cluster-config InstanceType=t3.medium.search,InstanceCount=1 \
-  --ebs-options EBSEnabled=true,VolumeType=gp3,VolumeSize=20 \
-  --access-policies '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": [
-          "arn:aws:iam::ACCOUNT_ID:role/MWAAExecutionRole",
-          "arn:aws:iam::ACCOUNT_ID:role/GlueServiceRole",
-          "arn:aws:iam::ACCOUNT_ID:role/LambdaExecutionRole",
-          "arn:aws:iam::ACCOUNT_ID:role/EC2InstanceProfile"
-        ]
-      },
-      "Action": "es:ESHttpPost",
-      "Resource": "arn:aws:es:REGION:ACCOUNT_ID:domain/etl-monitoring/etl-logs-*"
-    }]
-  }'
+  --engine-version "OpenSearch_2.11" \
+  --cluster-config "InstanceType=t3.medium.search,InstanceCount=1" \
+  --ebs-options "EBSEnabled=true,VolumeType=gp3,VolumeSize=20" \
+  --node-to-node-encryption-options "Enabled=true" \
+  --encryption-at-rest-options "Enabled=true" \
+  --domain-endpoint-options "EnforceHTTPS=true" \
+  --advanced-security-options "Enabled=false" \
+  --access-policies '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::ACCOUNT_ID:user/YOUR-IAM-USER"},"Action":"es:*","Resource":"arn:aws:es:REGION:ACCOUNT_ID:domain/etl-monitoring/*"}]}' \
+  --region us-east-1
 ```
 
-Wait for the domain status to become `Active` (typically 10–15 minutes):
+Wait ~15 minutes for the domain to become active:
 
 ```bash
 aws opensearch describe-domain --domain-name etl-monitoring \
-  --query 'DomainStatus.Processing'
+  --query "DomainStatus.{Processing:Processing,Endpoint:Endpoint}"
 ```
 
-Note the domain endpoint:
-
-```bash
-aws opensearch describe-domain --domain-name etl-monitoring \
-  --query 'DomainStatus.Endpoints.vpc // DomainStatus.Endpoint'
-```
+> **Browser access:** To access OpenSearch Dashboards from your browser, add your IP to the access policy:
+> ```bash
+> MY_IP=$(curl -s https://checkip.amazonaws.com)
+> aws opensearch update-domain-config --domain-name etl-monitoring \
+>   --access-policies "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::ACCOUNT_ID:user/YOUR-IAM-USER\"},\"Action\":\"es:*\",\"Resource\":\"arn:aws:es:REGION:ACCOUNT_ID:domain/etl-monitoring/*\"},{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"*\"},\"Action\":\"es:*\",\"Resource\":\"arn:aws:es:REGION:ACCOUNT_ID:domain/etl-monitoring/*\",\"Condition\":{\"IpAddress\":{\"aws:SourceIp\":\"$MY_IP/32\"}}}]}"
+> ```
 
 ### Step 3.3 — Store the OpenSearch endpoint in Secrets Manager
 
@@ -161,292 +153,220 @@ aws secretsmanager create-secret \
   --secret-string '{"opensearch_endpoint": "https://YOUR-DOMAIN-ENDPOINT"}'
 ```
 
+### Step 3.4 — Create the S3 bucket for MWAA
+
+```bash
+aws s3 mb s3://mwaa-etl-monitoring-ACCOUNT_ID --region us-east-1
+aws s3api put-bucket-versioning \
+  --bucket mwaa-etl-monitoring-ACCOUNT_ID \
+  --versioning-configuration Status=Enabled
+aws s3api put-public-access-block \
+  --bucket mwaa-etl-monitoring-ACCOUNT_ID \
+  --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+```
+
+### Step 3.5 — Create private subnets and NAT Gateway for MWAA
+
+> **Important:** MWAA requires private subnets. The default VPC only has public subnets, so you must create private ones.
+
+```bash
+# Create two private subnets in different AZs
+SUBNET_1=$(aws ec2 create-subnet \
+  --vpc-id YOUR-VPC-ID \
+  --cidr-block 172.31.96.0/20 \
+  --availability-zone us-east-1a \
+  --query "Subnet.SubnetId" --output text)
+
+SUBNET_2=$(aws ec2 create-subnet \
+  --vpc-id YOUR-VPC-ID \
+  --cidr-block 172.31.112.0/20 \
+  --availability-zone us-east-1b \
+  --query "Subnet.SubnetId" --output text)
+
+# Allocate an Elastic IP and create a NAT Gateway in a public subnet
+EIP=$(aws ec2 allocate-address --domain vpc --query "AllocationId" --output text)
+
+NAT_GW=$(aws ec2 create-nat-gateway \
+  --subnet-id YOUR-PUBLIC-SUBNET-ID \
+  --allocation-id $EIP \
+  --query "NatGateway.NatGatewayId" --output text)
+
+# Wait for NAT Gateway to be available
+aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_GW
+
+# Create a private route table and route traffic through the NAT Gateway
+RT=$(aws ec2 create-route-table --vpc-id YOUR-VPC-ID --query "RouteTable.RouteTableId" --output text)
+aws ec2 associate-route-table --route-table-id $RT --subnet-id $SUBNET_1
+aws ec2 associate-route-table --route-table-id $RT --subnet-id $SUBNET_2
+aws ec2 create-route --route-table-id $RT --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT_GW
+```
+
+### Step 3.6 — Create the MWAA environment
+
+```bash
+aws mwaa create-environment \
+  --name etl-monitoring-mwaa \
+  --airflow-version "2.9.2" \
+  --execution-role-arn arn:aws:iam::ACCOUNT_ID:role/MWAAExecutionRole \
+  --source-bucket-arn arn:aws:s3:::mwaa-etl-monitoring-ACCOUNT_ID \
+  --dag-s3-path dags/ \
+  --requirements-s3-path requirements.txt \
+  --webserver-access-mode PUBLIC_ONLY \
+  --network-configuration "SubnetIds=$SUBNET_1,$SUBNET_2,SecurityGroupIds=YOUR-SECURITY-GROUP-ID" \
+  --logging-configuration '{"DagProcessingLogs":{"Enabled":true,"LogLevel":"INFO"},"SchedulerLogs":{"Enabled":true,"LogLevel":"INFO"},"TaskLogs":{"Enabled":true,"LogLevel":"INFO"},"WebserverLogs":{"Enabled":true,"LogLevel":"INFO"},"WorkerLogs":{"Enabled":true,"LogLevel":"INFO"}}' \
+  --environment-class mw1.small \
+  --max-workers 2 \
+  --min-workers 1 \
+  --region us-east-1
+```
+
+> **Note:** Set `--webserver-access-mode PUBLIC_ONLY` so you can access the Airflow UI from your browser. Wait ~25 minutes for the environment to become `AVAILABLE`.
+
 ---
 
 ## Phase 4: OpenSearch Index Configuration
 
 ### Step 4.1 — Create the monthly index with the field mapping
 
-Replace `<OPENSEARCH_ENDPOINT>` and `<AWS_REGION>` with your values. Run this at the start of each month (or automate it with a Lambda/MWAA task).
-
 ```bash
-awscurl --service es --region <AWS_REGION> \
+awscurl --service es --region us-east-1 \
   -X PUT \
   -H "Content-Type: application/json" \
   -d @blog/config/index_mapping.json \
-  "https://<OPENSEARCH_ENDPOINT>/etl-logs-$(date +%Y-%m)"
-```
-
-Expected response:
-
-```json
-{"acknowledged": true, "shards_acknowledged": true, "index": "etl-logs-2024-03"}
+  "https://YOUR-OPENSEARCH-ENDPOINT/etl-logs-$(date +%Y-%m)"
 ```
 
 ### Step 4.2 — Apply the ISM 30-day retention policy
 
 ```bash
-awscurl --service es --region <AWS_REGION> \
+awscurl --service es --region us-east-1 \
   -X PUT \
   -H "Content-Type: application/json" \
   -d @blog/config/ism_policy.json \
-  "https://<OPENSEARCH_ENDPOINT>/_plugins/_ism/policies/etl-logs-retention"
-```
-
-### Step 4.3 — Verify the ISM policy is attached to the index
-
-```bash
-awscurl --service es --region <AWS_REGION> \
-  -X GET \
-  "https://<OPENSEARCH_ENDPOINT>/_plugins/_ism/explain/etl-logs-$(date +%Y-%m)"
+  "https://YOUR-OPENSEARCH-ENDPOINT/_plugins/_ism/policies/etl-logs-retention"
 ```
 
 ---
 
-## Phase 5: Deploy the LogShipper Library
+## Phase 5: Deploy DAG Files to MWAA
 
-### Step 5.1 — Deploy to AWS Glue
+> **Important:** When deploying to MWAA, the DAG files must use flat imports (not `blog.code.*` package paths) since all files are uploaded to the same `dags/` folder.
 
-Add the following to your Glue job's `--additional-python-modules` parameter:
-
-```
-requests==2.31.0,requests-aws4auth==1.3.1,boto3>=1.34.0
-```
-
-Upload `blog/code/log_event.py` and `blog/code/log_shipper.py` to S3 and add the S3 path to `--extra-py-files`:
+Use the MWAA-compatible versions in `infra/`:
 
 ```bash
-aws s3 cp blog/code/log_event.py s3://YOUR-BUCKET/glue-libs/log_event.py
-aws s3 cp blog/code/log_shipper.py s3://YOUR-BUCKET/glue-libs/log_shipper.py
+aws s3 cp infra/etl_workflow_dag_mwaa.py s3://mwaa-etl-monitoring-ACCOUNT_ID/dags/etl_workflow_dag.py
+aws s3 cp infra/dag_callbacks_mwaa.py s3://mwaa-etl-monitoring-ACCOUNT_ID/dags/dag_callbacks.py
+aws s3 cp infra/log_shipper_mwaa.py s3://mwaa-etl-monitoring-ACCOUNT_ID/dags/log_shipper.py
+aws s3 cp blog/code/log_event.py s3://mwaa-etl-monitoring-ACCOUNT_ID/dags/log_event.py
+aws s3 cp infra/requirements.txt s3://mwaa-etl-monitoring-ACCOUNT_ID/requirements.txt
 ```
 
-In your Glue job configuration:
+> **Note:** The `infra/` versions replace `from blog.code.X import Y` with `from X import Y` to work in the flat MWAA dags folder.
 
-```
---extra-py-files s3://YOUR-BUCKET/glue-libs/log_event.py,s3://YOUR-BUCKET/glue-libs/log_shipper.py
-```
-
-### Step 5.2 — Deploy to AWS Lambda as a layer
-
-```bash
-mkdir -p python/blog/code
-cp blog/code/log_event.py blog/code/log_shipper.py python/blog/code/
-pip install requests==2.31.0 requests-aws4auth==1.3.1 -t python/
-zip -r log_shipper_layer.zip python/
-
-aws lambda publish-layer-version \
-  --layer-name log-shipper \
-  --zip-file fileb://log_shipper_layer.zip \
-  --compatible-runtimes python3.9 python3.10 python3.11
-```
-
-Attach the layer to your Lambda function:
-
-```bash
-aws lambda update-function-configuration \
-  --function-name YOUR-FUNCTION-NAME \
-  --layers arn:aws:lambda:REGION:ACCOUNT_ID:layer:log-shipper:1
-```
-
-Add the required environment variables to the Lambda function:
-
-```bash
-aws lambda update-function-configuration \
-  --function-name YOUR-FUNCTION-NAME \
-  --environment Variables='{
-    "SECRET_NAME": "etl/opensearch/endpoint",
-    "INDEX_NAME": "etl-logs-2024-03"
-  }'
-```
-
-### Step 5.3 — Deploy to EC2
-
-SSH into the EC2 instance and install the dependencies:
-
-```bash
-pip install requests==2.31.0 requests-aws4auth==1.3.1 boto3>=1.34.0
-```
-
-Copy the library files to the instance:
-
-```bash
-scp blog/code/log_event.py blog/code/log_shipper.py ec2-user@YOUR-INSTANCE:/opt/etl/
-```
-
-### Step 5.4 — Deploy to MWAA
-
-Add the following lines to your MWAA environment's `requirements.txt`:
-
-```
-requests==2.31.0
-requests-aws4auth==1.3.1
-boto3>=1.34.0
-apache-airflow-providers-amazon>=8.0.0
-```
-
-Upload the updated `requirements.txt` to S3 and update the MWAA environment:
-
-```bash
-aws s3 cp requirements.txt s3://YOUR-MWAA-BUCKET/requirements.txt
-
-aws mwaa update-environment \
-  --name YOUR-MWAA-ENV \
-  --requirements-s3-path requirements.txt
-```
+> **Note:** `SsmRunCommandOperator` is not available in all versions of `apache-airflow-providers-amazon`. The `infra/etl_workflow_dag_mwaa.py` uses `PythonOperator` + `boto3` SSM client instead.
 
 ---
 
-## Phase 6: Instrument the Compute Components
+## Phase 6: Set Airflow Variables
 
-### Step 6.1 — Update the Glue job script
-
-Replace your existing Glue job script with the pattern from `blog/code/glue_job_example.py`. Key changes:
-
-1. Add `getResolvedOptions` args: `run_id`, `task_name`, `secret_name`, `index_name`, `region`
-2. Retrieve the OpenSearch endpoint via `LogShipper._get_endpoint_from_secrets_manager()`
-3. Wrap your ETL logic in `try/except/finally` and ship a `LogEvent` in the `finally` block
-
-### Step 6.2 — Update the Lambda handler
-
-Replace your existing Lambda handler with the pattern from `blog/code/lambda_handler_example.py`. Key changes:
-
-1. Instantiate `LogShipper` at module scope (outside the handler) for warm reuse
-2. Read `SECRET_NAME` and `INDEX_NAME` from environment variables
-3. Wrap your handler logic in `try/except/finally` and ship a `LogEvent` in the `finally` block
-
-### Step 6.3 — Update the EC2 script
-
-Replace your existing EC2 script with the pattern from `blog/code/ec2_script_example.py`. Key changes:
-
-1. Add CLI args: `--run-id`, `--task-name`, `--secret-name`, `--index-name`, `--region`
-2. Retrieve the instance ID via IMDSv2
-3. Wrap your processing logic in `try/except/finally` and ship a `LogEvent` in the `finally` block
-
-### Step 6.4 — Deploy the MWAA DAG
-
-Upload the DAG files to your MWAA S3 bucket:
+Access the Airflow UI:
 
 ```bash
-aws s3 cp blog/code/dag_callbacks.py s3://YOUR-MWAA-BUCKET/dags/dag_callbacks.py
-aws s3 cp blog/code/etl_workflow_dag.py s3://YOUR-MWAA-BUCKET/dags/etl_workflow_dag.py
+# Generate a login token (expires in 60 seconds — click immediately)
+TOKEN=$(aws mwaa create-web-login-token --name etl-monitoring-mwaa --region us-east-1 --query "WebToken" --output text)
+echo "https://YOUR-MWAA-WEBSERVER-URL/aws_mwaa/aws-console-sso?login=true#token=$TOKEN"
 ```
 
-Set the required Airflow Variables in the MWAA UI or via CLI:
+> **Tip:** Use the AWS Console → MWAA → click your environment → **Open Airflow UI** button to avoid token expiry issues.
 
-```bash
-# In the Airflow UI: Admin → Variables → Add
-opensearch_secret_name  = etl/opensearch/endpoint
-opensearch_index_name   = etl-logs-2024-03
-aws_region              = us-east-1
-sns_failure_topic_arn   = arn:aws:sns:REGION:ACCOUNT_ID:etl-failures
-glue_job_name           = YOUR-GLUE-JOB-NAME
-lambda_function_name    = YOUR-LAMBDA-FUNCTION-NAME
-ec2_instance_id         = YOUR-EC2-INSTANCE-ID
-```
+In the Airflow UI go to **Admin → Variables → +** and add:
+
+| Key | Value |
+|---|---|
+| `opensearch_secret_name` | `etl/opensearch/endpoint` |
+| `opensearch_index_name` | `etl-logs-YYYY-MM` (current month) |
+| `aws_region` | `us-east-1` |
+| `sns_failure_topic_arn` | `arn:aws:sns:us-east-1:ACCOUNT_ID:etl-failures` |
+| `glue_job_name` | Your Glue job name |
+| `lambda_function_name` | Your Lambda function name |
+| `ec2_instance_id` | Your EC2 instance ID |
 
 ---
 
-## Phase 7: Verify End-to-End
+## Phase 7: Configure OpenSearch Alerting
 
-### Step 7.1 — Trigger a test DAG run
-
-In the Airflow UI, trigger the `etl_workflow` DAG manually. Wait for it to complete.
-
-### Step 7.2 — Query OpenSearch for the run's events
-
-Replace `<RUN_ID>` with the DAG run ID from the Airflow UI (e.g., `manual__2024-03-15T10:00:00+00:00`):
+### Step 7.1 — Create the SNS notification channel
 
 ```bash
-awscurl --service es --region <AWS_REGION> \
-  -X GET \
+awscurl --service es --region us-east-1 \
+  -X POST \
   -H "Content-Type: application/json" \
-  -d '{"query": {"term": {"run_id": "<RUN_ID>"}}, "sort": [{"timestamp": {"order": "asc"}}]}' \
-  "https://<OPENSEARCH_ENDPOINT>/etl-logs-$(date +%Y-%m)/_search"
+  -d '{"config":{"name":"ETL Failures SNS Topic","description":"SNS channel for ETL pipeline failures","config_type":"sns","is_enabled":true,"sns":{"topic_arn":"arn:aws:sns:us-east-1:ACCOUNT_ID:etl-failures","role_arn":"arn:aws:iam::ACCOUNT_ID:role/OpenSearchAlertingRole"}}}' \
+  "https://YOUR-OPENSEARCH-ENDPOINT/_plugins/_notifications/configs"
 ```
 
-You should see `Log_Event` documents from all four component types (glue, lambda, ec2, mwaa).
+Note the `config_id` from the response.
 
-### Step 7.3 — Verify error events are captured
+> **Note:** OpenSearch 2.x uses the Notifications plugin (`_plugins/_notifications/configs`) instead of the legacy Destinations API. The Alerting UI will show a message saying "Destinations have become channels in Notifications" — this is expected.
 
-Intentionally fail a task (e.g., pass an invalid input to the Glue job) and confirm an `ERROR`-level `Log_Event` appears:
+### Step 7.2 — Apply the alert monitor
 
-```bash
-awscurl --service es --region <AWS_REGION> \
-  -X GET \
-  -H "Content-Type: application/json" \
-  -d @blog/config/dsl_query_errors.json \
-  "https://<OPENSEARCH_ENDPOINT>/etl-logs-$(date +%Y-%m)/_search"
-```
-
----
-
-## Phase 8: Build OpenSearch Dashboards
-
-### Step 8.1 — Create the index pattern
-
-1. Open OpenSearch Dashboards → **Stack Management → Index Patterns → Create index pattern**
-2. Pattern: `etl-logs-*`
-3. Time field: `timestamp`
-4. Click **Create index pattern**
-
-### Step 8.2 — Create the pipeline health dashboard
-
-Create a new dashboard with the following panels:
-
-**Panel 1 — Event count by log level (time series)**
-- Visualization type: Line or Area
-- X-axis: `timestamp` (date histogram, auto interval)
-- Split series: `log_level` (terms aggregation)
-
-**Panel 2 — Recent DAG runs (data table)**
-- Visualization type: Data Table
-- Split rows: `run_id` (terms, ordered by `timestamp` desc, size 20)
-- Metric columns: Count, filtered count for `log_level: ERROR`
-
-**Panel 3 — Average task duration by component (bar chart)**
-- Visualization type: Vertical Bar
-- X-axis: `component_type` (terms)
-- Y-axis: `avg(duration_ms)`
-
-### Step 8.3 — Add dashboard filters
-
-Add filter controls for: `run_id`, `task_name`, `component_type`, and the global time range picker.
-
----
-
-## Phase 9: Configure Alerting
-
-### Step 9.1 — Create the SNS destination in OpenSearch Dashboards
-
-1. Navigate to **Alerting → Destinations → Add destination**
-2. Name: `ETL Failures SNS`
-3. Type: `Amazon SNS`
-4. SNS Topic ARN: `arn:aws:sns:REGION:ACCOUNT_ID:etl-failures`
-5. IAM Role ARN: an IAM role with `sns:Publish` that OpenSearch Alerting can assume
-6. Save and note the destination ID
-
-### Step 9.2 — Update the alert monitor config
-
-Edit `blog/config/alert_monitor.json` and replace `"sns-destination-placeholder"` with the destination ID from Step 9.1.
-
-### Step 9.3 — Apply the alert monitor
+Update `blog/config/alert_monitor.json` replacing `"sns-destination-placeholder"` with the `config_id` from Step 7.1, then:
 
 ```bash
-awscurl --service es --region <AWS_REGION> \
+awscurl --service es --region us-east-1 \
   -X POST \
   -H "Content-Type: application/json" \
   -d @blog/config/alert_monitor.json \
-  "https://<OPENSEARCH_ENDPOINT>/_plugins/_alerting/monitors"
+  "https://YOUR-OPENSEARCH-ENDPOINT/_plugins/_alerting/monitors"
 ```
 
-### Step 9.4 — (Optional) Enable anomaly detection on `duration_ms`
+The monitor checks every 5 minutes and fires when ERROR event count > 5 in the rolling window.
 
-1. Navigate to **Anomaly Detection → Create detector**
-2. Index: `etl-logs-*`, timestamp field: `timestamp`
-3. Feature: `average(duration_ms)`
-4. Category field: `component_type`
-5. Detection interval: 10 minutes, window delay: 1 minute
-6. Enable real-time detection and link to an alert monitor
+---
+
+## Phase 8: Set Up OpenSearch Dashboard
+
+Create the index pattern, visualizations, and dashboard via the API:
+
+```bash
+OS_ENDPOINT="https://YOUR-OPENSEARCH-ENDPOINT"
+
+# 1. Create index pattern
+awscurl --service es --region us-east-1 -X POST \
+  -H "Content-Type: application/json" -H "osd-xsrf: true" \
+  -d '{"attributes":{"title":"etl-logs-*","timeFieldName":"timestamp"}}' \
+  "$OS_ENDPOINT/_dashboards/api/saved_objects/index-pattern/etl-logs-pattern"
+
+# 2. Create visualizations and dashboard
+# (See infra/create_dashboard.sh for the full script)
+```
+
+Access the dashboard at:
+```
+https://YOUR-OPENSEARCH-ENDPOINT/_dashboards/app/dashboards#/view/etl-monitoring-dashboard
+```
+
+---
+
+## Phase 9: Verify End-to-End
+
+### Step 9.1 — Trigger a test DAG run
+
+In the Airflow UI, find `etl_workflow`, toggle it on, and click **Trigger DAG**.
+
+### Step 9.2 — Query OpenSearch for events
+
+```bash
+awscurl --service es --region us-east-1 \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"query":{"match_all":{}},"sort":[{"timestamp":{"order":"desc"}}],"size":10}' \
+  "https://YOUR-OPENSEARCH-ENDPOINT/etl-logs-$(date +%Y-%m)/_search"
+```
+
+You should see `Log_Event` documents with `run_id`, `task_name`, `log_level`, and `timestamp`.
 
 ---
 
@@ -454,25 +374,17 @@ awscurl --service es --region <AWS_REGION> \
 
 ### Monthly index creation
 
-At the start of each month, create the new index:
-
 ```bash
-awscurl --service es --region <AWS_REGION> \
+awscurl --service es --region us-east-1 \
   -X PUT \
   -H "Content-Type: application/json" \
   -d @blog/config/index_mapping.json \
-  "https://<OPENSEARCH_ENDPOINT>/etl-logs-$(date +%Y-%m)"
+  "https://YOUR-OPENSEARCH-ENDPOINT/etl-logs-$(date +%Y-%m)"
 ```
 
-Consider automating this with a scheduled MWAA DAG or EventBridge + Lambda.
-
-### Updating the Airflow Variable for the current index
-
-Each month, update the `opensearch_index_name` Airflow Variable to the new index name (e.g., `etl-logs-2024-04`).
+Update the `opensearch_index_name` Airflow Variable to the new month.
 
 ### Rotating the OpenSearch endpoint secret
-
-If you migrate to a new OpenSearch domain, update the Secrets Manager secret value. All compute components will pick up the new endpoint on their next invocation — no code changes or redeployments needed:
 
 ```bash
 aws secretsmanager update-secret \
@@ -486,11 +398,16 @@ aws secretsmanager update-secret \
 
 | Issue | Likely Cause | Resolution |
 |---|---|---|
-| Log_Events not appearing in OpenSearch | IAM role missing `es:ESHttpPost`, wrong index name, or wrong endpoint | Check `LogShipper` logs for HTTP 403. Verify the IAM policy ARN matches the domain ARN exactly. Confirm the index name in the Airflow Variable matches the index you created. |
-| SigV4 authentication errors (`AuthorizationException`) | `requests-aws4auth` not installed, wrong region, or IAM role not attached | Confirm `requests-aws4auth==1.3.1` is installed. Verify the `region` matches the OpenSearch domain region. Check the IAM role is attached to the compute resource. |
-| OpenSearch index mapping conflicts | Field type mismatch between the document and the existing mapping | Delete and recreate the index with `blog/config/index_mapping.json`. The `dynamic: strict` setting will reject unknown fields with a 400 error — check the `LogShipper` error log for the rejected field name. |
-| MWAA DAG not picking up new `requirements.txt` | MWAA environment update still in progress | Check the MWAA environment status in the console. Updates can take 20–30 minutes. |
-| SNS notifications not firing | OpenSearch Alerting destination misconfigured or IAM role missing `sns:Publish` | Verify the destination ID in `alert_monitor.json` matches the saved destination. Check the OpenSearch Alerting role has `sns:Publish` on the topic ARN. |
+| Log_Events not appearing in OpenSearch | IAM role missing `es:ESHttpPost`, wrong index name, or wrong endpoint | Check `LogShipper` logs for HTTP 403. Verify the IAM policy ARN matches the domain ARN exactly. |
+| SigV4 authentication errors | `requests-aws4auth` not installed, wrong region, or IAM role not attached | Confirm `requests-aws4auth==1.3.1` is installed. Verify the `region` matches the OpenSearch domain region. |
+| OpenSearch index mapping conflicts | Field type mismatch | Delete and recreate the index with `blog/config/index_mapping.json`. |
+| MWAA DAG broken — `ModuleNotFoundError: No module named 'blog'` | DAG files use `blog.code.*` imports but MWAA uses a flat `dags/` folder | Use the MWAA-compatible files in `infra/` which use flat imports (`from log_event import ...`). |
+| MWAA DAG broken — `SsmRunCommandOperator` not found | Operator not available in installed provider version | Use `PythonOperator` + `boto3` SSM client instead (already done in `infra/etl_workflow_dag_mwaa.py`). |
+| MWAA DAG broken — `poll_interval` invalid argument | `GlueJobOperator` version doesn't support this parameter | Remove `poll_interval` from `GlueJobOperator` constructor. |
+| MWAA webserver link gives "permission" error | Login token expired (60-second TTL) | Generate and click the token URL in the same command: `TOKEN=$(aws mwaa create-web-login-token ...) && echo "https://...#token=$TOKEN"` |
+| OpenSearch Dashboards "anonymous user" error | Browser access not allowed by domain access policy | Add your IP to the OpenSearch access policy (see Phase 3.2). |
+| Destinations API returns 405 | OpenSearch 2.x uses Notifications plugin, not legacy Destinations | Use `_plugins/_notifications/configs` endpoint instead. |
+| MWAA environment creation fails — "subnets must be private" | Default VPC only has public subnets | Create private subnets with a NAT Gateway (see Phase 3.5). |
 
 ---
 
@@ -499,17 +416,21 @@ aws secretsmanager update-secret \
 | File | Purpose |
 |---|---|
 | `blog/code/log_event.py` | `LogEvent` dataclass — shared schema |
-| `blog/code/log_shipper.py` | `LogShipper` class — SigV4 HTTP client |
-| `blog/code/glue_job_example.py` | Glue job call-site example |
-| `blog/code/lambda_handler_example.py` | Lambda handler call-site example |
-| `blog/code/ec2_script_example.py` | EC2 script call-site example |
-| `blog/code/dag_callbacks.py` | MWAA DAG callback functions |
-| `blog/code/etl_workflow_dag.py` | MWAA DAG definition |
+| `blog/code/log_shipper.py` | `LogShipper` class — SigV4 HTTP client (original, uses `blog.code.*` imports) |
+| `blog/code/dag_callbacks.py` | MWAA DAG callback functions (original) |
+| `blog/code/etl_workflow_dag.py` | MWAA DAG definition (original) |
+| `infra/log_shipper_mwaa.py` | `LogShipper` — MWAA-compatible (flat imports) |
+| `infra/dag_callbacks_mwaa.py` | DAG callbacks — MWAA-compatible (flat imports) |
+| `infra/etl_workflow_dag_mwaa.py` | DAG definition — MWAA-compatible (flat imports, PythonOperator for SSM) |
+| `infra/requirements.txt` | Python dependencies for MWAA |
+| `infra/mwaa-trust-policy.json` | Trust policy for MWAAExecutionRole |
+| `infra/mwaa-execution-policy.json` | Permissions policy for MWAAExecutionRole |
+| `infra/opensearch-alerting-trust-policy.json` | Trust policy for OpenSearchAlertingRole |
 | `blog/config/index_mapping.json` | OpenSearch index field mapping |
 | `blog/config/ism_policy.json` | ISM 30-day retention policy |
-| `blog/config/iam_policy_opensearch.json` | Least-privilege IAM policy |
+| `blog/config/iam_policy_opensearch.json` | Least-privilege IAM policy for compute roles |
+| `blog/config/alert_monitor.json` | OpenSearch alerting monitor config |
 | `blog/config/dsl_query_by_run_id.json` | Query: all events for a run |
 | `blog/config/dsl_query_errors.json` | Query: ERROR events in time range |
 | `blog/config/dsl_query_duration_agg.json` | Query: avg duration by component |
 | `blog/config/dsl_query_p95_duration.json` | Query: p95 duration by component |
-| `blog/config/alert_monitor.json` | OpenSearch alerting monitor config |
