@@ -1,3 +1,7 @@
+### Authors 
+- Sean Bjurstrom @bjurstro 
+- Anupa Bhattacharyya @bhattace
+
 # Monitoring MWAA-Orchestrated ETL Pipelines with Amazon OpenSearch Service
 
 ---
