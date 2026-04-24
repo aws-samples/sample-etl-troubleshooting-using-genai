@@ -398,15 +398,6 @@ You should see `Log_Event` documents from `lambda` and `ec2` component types wit
 | Destinations API returns 405 | OpenSearch 2.x uses Notifications plugin | Use `_plugins/_notifications/configs` endpoint instead. |
 | MWAA environment creation fails — "subnets must be private" | Default VPC only has public subnets | Create private subnets with a NAT Gateway before deploying. |
 
-## Clean up
-
-To avoid ongoing charges, delete the resources in the following order:
-
-1. Delete the CloudFormation stack: `aws cloudformation delete-stack --stack-name etl-monitoring`
-2. Empty and delete the S3 bucket: `aws s3 rb s3://$BUCKET --force`
-3. Delete the OpenSearch domain (if not managed by the stack): `aws opensearch delete-domain --domain-name etl-monitoring`
-4. Stop the SageMaker notebook instance: `aws sagemaker stop-notebook-instance --notebook-instance-name etl-monitoring-log-analysis`
-
 ## Conclusion
 
 By centralizing structured log events from MWAA, Glue, Lambda, and EC2 into a single Amazon OpenSearch Service index, you gain full observability over your distributed ETL pipeline from a single pane of glass. The `run_id` correlation key ties every log event from a single pipeline run together, so investigating a failure takes one query instead of five browser tabs.
@@ -426,6 +417,101 @@ The solution delivers:
 - Explore OpenSearch ML Commons for semantic anomaly detection on the `message` field
 
 If you have questions or feedback, leave a comment below. For additional discussion, visit the [OpenSearch Community](https://forum.opensearch.org/).
+
+## Clean up
+
+When you are done with the solution, delete the resources below to stop incurring charges. The resources are listed in the order that minimizes dependency conflicts.
+
+**Step 1 — Stop the SageMaker notebook instance.**
+
+A running notebook instance incurs charges even when idle. Stop it first:
+
+```bash
+aws sagemaker stop-notebook-instance \
+  --notebook-instance-name etl-monitoring-log-analysis \
+  --region us-east-1
+```
+
+To delete it entirely:
+
+```bash
+aws sagemaker delete-notebook-instance \
+  --notebook-instance-name etl-monitoring-log-analysis \
+  --region us-east-1
+```
+
+**Step 2 — Delete the MWAA environment.**
+
+MWAA is the most expensive resource in this stack. Deleting it takes approximately 20 minutes:
+
+```bash
+aws mwaa delete-environment \
+  --name etl-monitoring-mwaa \
+  --region us-east-1
+```
+
+**Step 3 — Empty the S3 bucket.**
+
+CloudFormation cannot delete a non-empty S3 bucket. Empty it first:
+
+```bash
+BUCKET="etl-monitoring-$(aws sts get-caller-identity --query Account --output text)"
+aws s3 rm s3://$BUCKET --recursive
+```
+
+**Step 4 — Delete the CloudFormation stack.**
+
+This removes all remaining resources created by the stack — OpenSearch domain, Lambda function, Glue job, EC2 instance, IAM roles, SNS topic, Secrets Manager secret, and security group:
+
+```bash
+aws cloudformation delete-stack \
+  --stack-name etl-monitoring \
+  --region us-east-1
+```
+
+Monitor the deletion progress:
+
+```bash
+aws cloudformation wait stack-delete-complete \
+  --stack-name etl-monitoring \
+  --region us-east-1
+echo "Stack deleted"
+```
+
+**Step 5 — Delete the S3 bucket.**
+
+Once the stack is deleted, remove the bucket itself:
+
+```bash
+aws s3 rb s3://$BUCKET --force
+```
+
+**Step 6 — Release the Elastic IP (if you created private subnets manually).**
+
+If you created a NAT Gateway outside of CloudFormation, release the associated Elastic IP to avoid charges:
+
+```bash
+# Find the allocation ID
+aws ec2 describe-addresses --region us-east-1 \
+  --query "Addresses[?Tags[?Key=='Name' && Value=='mwaa-nat-gw']].AllocationId" \
+  --output text
+
+# Release it
+aws ec2 release-address --allocation-id eipalloc-XXXXXXXXXX --region us-east-1
+```
+
+**Step 7 — Verify no resources remain.**
+
+Confirm the OpenSearch domain and MWAA environment are gone:
+
+```bash
+aws opensearch list-domain-names --region us-east-1
+aws mwaa list-environments --region us-east-1
+```
+
+Both should return empty lists.
+
+> **Cost note:** The OpenSearch domain (`t3.medium.search`, 20 GB gp3) costs approximately $0.07/hour. The MWAA environment (`mw1.small`) costs approximately $0.49/hour plus worker costs. The NAT Gateway costs approximately $0.045/hour plus data processing charges. Deleting these resources promptly after completing the walkthrough avoids unexpected charges.
 
 ## About the authors
 
