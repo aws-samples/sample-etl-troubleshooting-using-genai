@@ -50,7 +50,7 @@ def run_ec2_ssm_command(**context) -> None:
     """Send an SSM Run Command to the EC2 instance and wait for completion."""
     import time
 
-    run_id = context["run_id"]
+    run_id = context.get("run_id") or context.get("dag_run").run_id
     instance_id = Variable.get("ec2_instance_id", default_var="")
     region = Variable.get("aws_region", default_var="us-east-1")
 
@@ -65,7 +65,10 @@ def run_ec2_ssm_command(**context) -> None:
         Parameters={
             "commands": [
                 f"export RUN_ID={run_id}",
-                "python3 /opt/etl/custom_script.py",
+                "export OPENSEARCH_ENDPOINT=https://search-etl-monitoring-mz7zpvh76up33iejfbl7ock3oq.us-east-1.es.amazonaws.com",
+                "export OPENSEARCH_INDEX=etl-logs-2026-04",
+                "export AWS_DEFAULT_REGION=us-east-1",
+                "cd /opt/etl && python3 custom_script.py",
             ],
             "executionTimeout": ["3600"],
         },
@@ -114,10 +117,11 @@ with DAG(
         task_id="glue_extraction",
         job_name="{{ var.value.glue_job_name }}",
         script_args={
-            "run_id": "{{ run_id }}",
-            "source_path": "{{ var.value.glue_source_path }}",
-            "target_path": "{{ var.value.glue_target_path }}",
-            "partition_date": "{{ ds }}",
+            "--JOB_NAME": "{{ var.value.glue_job_name }}",
+            "--run_id": "{{ run_id }}",
+            "--source_path": "{{ var.value.glue_source_path }}",
+            "--target_path": "{{ var.value.glue_target_path }}",
+            "--partition_date": "{{ ds }}",
         },
         aws_conn_id="aws_default",
         wait_for_completion=True,

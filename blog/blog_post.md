@@ -2322,3 +2322,122 @@ This guide walked through a complete, production-ready solution for centralizing
 **Cross-account log aggregation** — If your ETL pipeline spans multiple AWS accounts (e.g., a data lake account for Glue and a processing account for Lambda), deploy a central OpenSearch domain in a dedicated observability account and grant `es:ESHttpPost` to the IAM roles in each source account. All `Log_Events` flow to the same index regardless of which account they originate from.
 
 **OpenSearch ML-powered alerting** — OpenSearch's ML Commons plugin supports semantic search and anomaly detection models that can identify unusual patterns in log messages, not just in numeric fields like `duration_ms`. Once you have a few months of `Log_Events` indexed, explore the ML Commons documentation to set up a semantic anomaly detector on the `message` field.
+
+---
+
+## 13. Querying Logs with Natural Language Using the OpenSearch MCP Server
+
+Once your `Log_Events` are flowing into OpenSearch, you can query them using natural language through the [OpenSearch MCP Server](https://github.com/opensearch-project/opensearch-mcp-server-py) — an open-source Model Context Protocol (MCP) server that lets AI assistants interact directly with your OpenSearch cluster.
+
+### What is the OpenSearch MCP Server?
+
+The OpenSearch MCP Server exposes your OpenSearch cluster as a set of tools that any MCP-compatible AI assistant (such as Amazon Kiro, Claude Desktop, or LangChain) can call. Instead of writing DSL queries manually, you describe what you want in plain English and the AI translates it into the correct query, executes it, and summarizes the results.
+
+### Setting Up the OpenSearch MCP Server
+
+**Step 1 — Install the server**
+
+```bash
+pip install opensearch-mcp-server-py
+```
+
+**Step 2 — Configure your MCP client**
+
+Add the following to your MCP client configuration (e.g., `~/.kiro/settings/mcp.json` for Amazon Kiro):
+
+```json
+{
+  "mcpServers": {
+    "opensearch-mcp": {
+      "command": "uvx",
+      "args": ["opensearch-mcp-server-py@latest"],
+      "env": {
+        "OPENSEARCH_URL": "https://YOUR-OPENSEARCH-ENDPOINT",
+        "AWS_REGION": "us-east-1",
+        "OPENSEARCH_AUTH_TYPE": "awssigv4",
+        "OPENSEARCH_SERVICE": "es",
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "SearchIndexTool",
+        "ListIndexTool",
+        "IndexMappingTool",
+        "ClusterHealthTool",
+        "CountTool"
+      ]
+    }
+  }
+}
+```
+
+Replace `YOUR-OPENSEARCH-ENDPOINT` with your domain endpoint. The server uses your existing AWS credentials (IAM role or `~/.aws/credentials`) for SigV4 authentication — no username or password required.
+
+**Step 3 — Reconnect the MCP server**
+
+In your MCP client, find the `opensearch-mcp` server and click **Reconnect** (or restart the client). The server will connect to your OpenSearch domain and make the following tools available:
+
+| Tool | Description |
+|---|---|
+| `SearchIndexTool` | Search an index using natural language or DSL |
+| `ListIndexTool` | List all indices with document counts and sizes |
+| `IndexMappingTool` | Retrieve field mappings for an index |
+| `ClusterHealthTool` | Check cluster health status |
+| `CountTool` | Count documents matching a query |
+
+### Example Natural Language Queries
+
+Once connected, you can ask questions like:
+
+**"Show me all ERROR events from the last hour"**
+
+The AI translates this to a `bool/filter` query combining `log_level: ERROR` and a `timestamp` range, executes it, and returns the results:
+
+```
+1 ERROR event found:
+- run_id: manual__2026-04-24T14:16:54+00:00
+- task_name: glue_extraction
+- message: Task 'glue_extraction' failed: Variable glue_job_name does not exist
+- timestamp: 2026-04-24T14:17:00Z
+```
+
+**"How many log events are in the index?"**
+
+```
+19 total documents in etl-logs-2026-04
+```
+
+**"What tasks have run successfully in the last 24 hours?"**
+
+The AI queries for `log_level: INFO` events, groups by `task_name`, and summarizes:
+
+```
+Successful tasks in the last 24 hours:
+- lambda_transform: 3 successful runs
+- ec2_custom_script: 4 successful runs
+```
+
+**"Show me the average duration for each component type"**
+
+The AI constructs a `terms` aggregation with an `avg` sub-aggregation on `duration_ms`:
+
+```
+Average task duration by component:
+- lambda: 0 ms (lightweight transform)
+- ec2: 10 ms (custom script)
+```
+
+### Why This Matters
+
+Writing OpenSearch DSL queries requires knowing the exact field names, query syntax, and aggregation structure. The MCP server removes that barrier — anyone on your team can investigate pipeline failures, check error rates, or analyze performance trends without needing to know DSL. The AI handles the translation, and the results come back in plain English.
+
+This is particularly useful for:
+- **On-call engineers** who need to quickly diagnose a 2 AM pipeline failure without looking up query syntax
+- **Data engineers** who want to explore log patterns without switching to the Dashboards UI
+- **Platform teams** who want to build natural language observability into their internal tooling
+
+### Available Tools Reference
+
+The OpenSearch MCP Server exposes additional tools beyond the core set. To enable them, set `OPENSEARCH_DISABLED_CATEGORIES` in your environment config. The full list includes tools for cluster state, node metrics, segment information, query insights, and long-running task detection — all queryable through natural language.
+
+For the complete tool reference and advanced configuration options, see the [opensearch-mcp-server-py documentation](https://github.com/opensearch-project/opensearch-mcp-server-py).

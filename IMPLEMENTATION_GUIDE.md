@@ -434,3 +434,79 @@ aws secretsmanager update-secret \
 | `blog/config/dsl_query_errors.json` | Query: ERROR events in time range |
 | `blog/config/dsl_query_duration_agg.json` | Query: avg duration by component |
 | `blog/config/dsl_query_p95_duration.json` | Query: p95 duration by component |
+
+---
+
+## Phase 11: Natural Language Log Querying with the OpenSearch MCP Server
+
+### Step 11.1 — Install the OpenSearch MCP Server
+
+```bash
+pip install opensearch-mcp-server-py
+```
+
+Or use `uvx` (no install required):
+
+```bash
+uvx opensearch-mcp-server-py@latest
+```
+
+### Step 11.2 — Configure your MCP client
+
+Add the following to your MCP client config. For Amazon Kiro, edit `~/.kiro/settings/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "opensearch-mcp": {
+      "command": "uvx",
+      "args": ["opensearch-mcp-server-py@latest"],
+      "env": {
+        "OPENSEARCH_URL": "https://search-etl-monitoring-mz7zpvh76up33iejfbl7ock3oq.us-east-1.es.amazonaws.com",
+        "AWS_REGION": "us-east-1",
+        "OPENSEARCH_AUTH_TYPE": "awssigv4",
+        "OPENSEARCH_SERVICE": "es",
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "SearchIndexTool",
+        "ListIndexTool",
+        "IndexMappingTool",
+        "ClusterHealthTool",
+        "CountTool"
+      ]
+    }
+  }
+}
+```
+
+### Step 11.3 — Reconnect the MCP server
+
+In Kiro: open the MCP panel (Command Palette → "MCP"), find `opensearch-mcp`, and click **Reconnect**.
+
+### Step 11.4 — Verify the connection
+
+Ask the AI: *"How many events are in the etl-logs-2026-04 index?"*
+
+Expected response: a count of documents confirming the server is connected.
+
+### Step 11.5 — Example queries
+
+Once connected, you can ask natural language questions directly:
+
+| Question | What it does |
+|---|---|
+| "Show me all ERROR events from the last hour" | Queries `log_level: ERROR` with a timestamp range filter |
+| "What tasks ran successfully today?" | Queries `log_level: INFO` grouped by `task_name` |
+| "Show me all events for run_id X" | Queries by exact `run_id` match, sorted by timestamp |
+| "What is the average duration for each component type?" | Runs a `terms` + `avg` aggregation on `duration_ms` |
+| "How many total log events are in the index?" | Runs a `count` query |
+| "Show me the most recent pipeline failures" | Queries `log_level: ERROR` sorted by timestamp descending |
+
+### Notes
+
+- Authentication uses your existing AWS credentials via SigV4 — no username or password needed
+- The server requires `es:ESHttpGet` and `es:ESHttpPost` permissions on the OpenSearch domain
+- If your domain uses IP-based access control, ensure your machine's IP is in the access policy
+- The `autoApprove` list controls which tools run without confirmation — add or remove tools as needed
