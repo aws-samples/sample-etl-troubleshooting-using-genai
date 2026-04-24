@@ -59,12 +59,14 @@ def run_ec2_ssm_command(**context) -> None:
 
     ssm = boto3.client("ssm", region_name=region)
 
+    # Send the command ONCE and capture the command_id
     response = ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
         Parameters={
             "commands": [
                 f"export RUN_ID={run_id}",
+                f"export INSTANCE_ID={instance_id}",
                 "export OPENSEARCH_ENDPOINT=https://search-etl-monitoring-mz7zpvh76up33iejfbl7ock3oq.us-east-1.es.amazonaws.com",
                 "export OPENSEARCH_INDEX=etl-logs-2026-04",
                 "export AWS_DEFAULT_REGION=us-east-1",
@@ -76,21 +78,25 @@ def run_ec2_ssm_command(**context) -> None:
 
     command_id = response["Command"]["CommandId"]
 
-    # Poll until the command completes
-    for _ in range(120):  # max 10 minutes
-        time.sleep(5)
+    # Wait for the command to be delivered before polling
+    time.sleep(10)
+
+    # Poll for terminal status — do NOT re-send the command
+    terminal_statuses = {"Success", "Failed", "Cancelled", "TimedOut", "Undeliverable", "Terminated"}
+    for _ in range(120):  # max 10 minutes (120 x 5s)
         result = ssm.get_command_invocation(
             CommandId=command_id,
             InstanceId=instance_id,
         )
-        status = result["Status"]
+        status = result["StatusDetails"]
         if status == "Success":
             return
-        if status in ("Failed", "Cancelled", "TimedOut", "Undeliverable"):
+        if status in terminal_statuses:
             raise RuntimeError(
                 f"SSM command {command_id} failed with status: {status}\n"
                 f"stderr: {result.get('StandardErrorContent', '')}"
             )
+        time.sleep(5)
 
     raise TimeoutError(f"SSM command {command_id} did not complete within 10 minutes")
 
