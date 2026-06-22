@@ -1,0 +1,61 @@
+version: 2.0
+
+# BEGIN Locale
+defaultLocaleCode: en-US
+localeCodes:
+  - en-US
+# END Locale
+
+params:
+  hello: world
+  foo:
+    - bar
+
+# START Infrastructure
+infrastructure:
+  cloudformationTemplates:
+    - templateLocation: static/templates/opensearch_cfn.yaml
+      label: Vector Search with RAG using OpenSearch
+      participantAllStackOutputsVisible: true
+      parameters:
+        # magic vars
+        - templateParameter: OpenSearchUsername
+          defaultValue: "admin"
+        - templateParameter: OpenSearchPassword
+          defaultValue: "Semantic123!"
+    - templateLocation: static/templates/agentcore-mcp-server.yaml
+      label: OpenSearch MCP Server
+      participantAllStackOutputsVisible: true
+    - templateLocation: static/templates/etl.yaml
+      label: Observability ETL Pipeline
+      participantAllStackOutputsVisible: true
+    
+# END Infrastructure
+
+# START Accounts
+awsAccountConfig:
+  accountSources:
+    - WorkshopStudio
+  serviceLinkedRoles:
+    - appsync.amazonaws.com
+  participantRole:
+    managedPolicies:
+      - "arn:aws:iam::aws:policy/IAMReadOnlyAccess"
+      - "arn:aws:iam::aws:policy/AdministratorAccess"
+    trustedPrincipals:
+      service:
+        - ec2.amazonaws.com
+        - lambda.amazonaws.com
+  regionConfiguration:
+    minAccessibleRegions: 1
+    maxAccessibleRegions: 3
+    accessibleRegions:
+      recommended:
+        - us-west-2
+        - us-east-1
+        - us-east-2
+    deployableRegions:
+      recommended:
+        - us-west-2
+        - us-east-1
+# END Accounts
