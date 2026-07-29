@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to provision OpenSearch cluster and SageMaker Notebook for semantic search
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required Parameters
+        Parameters:
+          - OpenSearchUsername
+          - OpenSearchPassword
+    ParameterLabels:
+      OpenSearchUsername:
+        default: OpenSearch cluster username
+      OpenSearchPassword:
+        default: OpenSearch cluster password
+      SageMakerNotebookName:
+        default: Name of SageMaker Notebook Instance
+      
+Parameters:
+  OpenSearchUsername:
+    AllowedPattern: '^[a-zA-Z0-9]+$'
+    Default: admin
+    Description: User name for the account that will be added to the OpenSearch cluster.
+    MaxLength: '25'
+    MinLength: '5'
+    Type: String
+  OpenSearchPassword:
+    AllowedPattern: '(?=^.{8,32}$)((?=.*\d)(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[^A-Za-z0-9])(?=.*[a-z])|(?=.*[^A-Za-z0-9])(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[A-Z])(?=.*[^A-Za-z0-9]))^.*'
+    Description: Password for the account named above. Must be at least 8 characters containing letters, numbers and symbols
+    MaxLength: '32'
+    MinLength: '8'
+    NoEcho: 'true'
+    Type: String
+    Default: Semantic123!
+
+
+
+Resources:
+
+  OpenSearchSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub OpenSearchSecret-${AWS::StackName}
+      Description: OpenSearch username and password
+      SecretString: !Sub '{ "username" : "${OpenSearchUsername}", "password" : "${OpenSearchPassword}" }'
+
+  NotebookInstanceLifecycleConfiguration:
+    Type: AWS::SageMaker::NotebookInstanceLifecycleConfig
+    Properties:
+      NotebookInstanceLifecycleConfigName: webapp-app-launch
+      OnStart: 
+        - Content:
+            Fn::Base64: 
+              Fn::Sub:
+                - |
+                  #!/bin/bash
+                  cd /home/ec2-user/SageMaker
+                  sudo yum install -y awscli zip
+                  curl https://ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0.s3.us-west-2.amazonaws.com/8b5c9a36-6874-4f13-a4a2-b1bff1363694/assets.zip > assets.zip
+                  unzip assets.zip
+                  sudo chmod -R 0777 /home/ec2-user/SageMaker
+                - s3Bucket: !Ref s3BucketHosting
+
+
+  NotebookInstance:
+    Type: AWS::SageMaker::NotebookInstance
+    Properties:
+      NotebookInstanceName: semantic-search-nb
+      InstanceType: ml.m5d.2xlarge
+      RoleArn: !GetAtt NBRole.Arn
+      VolumeSizeInGB : 200
+      LifecycleConfigName: !GetAtt NotebookInstanceLifecycleConfiguration.NotebookInstanceLifecycleConfigName
+
+
+
+  AmazonBedrockBatchInfererenceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: BedrockTrust
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "es:ESHttp*"
+                Resource:
+                  - !GetAtt OpenSearchServiceDomain.Arn
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !GetAtt s3BucketTraining.Arn
+                  - !GetAtt s3BucketHosting.Arn
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource:
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'                  
+                  - !Sub 'arn:aws:bedrock:us-east-1::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:us-east-1:${AWS::AccountId}:inference-profile/*'                  
+                  - !Sub 'arn:aws:bedrock:us-east-2::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:us-east-2:${AWS::AccountId}:inference-profile/*'                  
+                  - !Sub 'arn:aws:bedrock:us-west-1::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:us-west-1:${AWS::AccountId}:inference-profile/*'    
+              - Effect: Allow
+                Action:
+                  - 'bedrock:ListFoundationModels'
+                Resource: '*'
+        - PolicyName: AgentCoreMarketSubscription
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MarketplaceOperationsFromBedrockFor3pModels
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Unsubscribe
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - opensearchservice.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+              ArnEquals:
+                aws:SourceArn:
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-invocation-job/*
+      
+  NBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: CustomNotebookAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "es:ESHttp*"
+                Resource:
+                  - !GetAtt OpenSearchServiceDomain.Arn
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !GetAtt s3BucketTraining.Arn
+                  - !GetAtt s3BucketHosting.Arn
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource:
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+              - Effect: Allow
+                Action:
+                  - 'bedrock:ListFoundationModels'
+                Resource: '*'
+              # - Effect: Allow
+              #   Action:
+              #     - "s3:*"
+              #     - "dynamodb:*"
+              #     - "bedrock:InvokeModel"
+              #     - "bedrock:InvokeModelWithResponseStream"
+              #     - "bedrock:*"
+              #   Resource:
+              #     - "*"
+              - Effect: Allow
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                  - "sts:AssumeRole"
+                Resource:
+                  - !GetAtt AmazonBedrockBatchInfererenceRole.Arn
+              - Effect: Allow
+                Action:
+                  - "iam:GetRole"
+                  - "iam:CreateRole"
+                  - "iam:PutRolePolicy"
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/CWLtoOpenSearchDeliveryRole
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/CWLtoOpenSearchLambdaRole
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/CWLtoOpenSearchLambdaRole
+              - Effect: Allow
+                Action:
+                  - "lambda:CreateFunction"
+                  - "lambda:UpdateFunctionCode"
+                  - "lambda:UpdateFunctionConfiguration"
+                  - "lambda:GetFunction"
+                  - "lambda:AddPermission"
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:CWLtoOpenSearch
+              - Effect: Allow
+                Action:
+                  - "airflow:CreateCliToken"
+                  - "airflow:CreateWebLoginToken"
+                Resource:
+                  - !Sub arn:aws:airflow:${AWS::Region}:${AWS::AccountId}:environment/*
+              - Effect: Allow
+                Action:
+                  - "logs:PutSubscriptionFilter"
+                  - "logs:DeleteSubscriptionFilter"
+                  - "logs:DescribeLogGroups"
+                  - "logs:DescribeSubscriptionFilters"
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+        - PolicyName: AgentCoreMarketSubscription
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MarketplaceOperationsFromBedrockFor3pModels
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Unsubscribe
+                Resource: "*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AWSCloudFormationReadOnlyAccess
+        - arn:aws:iam::aws:policy/TranslateReadOnly
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - sagemaker.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  s3BucketTraining:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: Enabled
+
+  s3BucketHosting:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: Enabled
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+  OpenSearchServiceDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      AccessPolicies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: 'es:*'
+            Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/*/*
+      EngineVersion: 'OpenSearch_3.5'
+      ClusterConfig:
+        InstanceType: "r6g.2xlarge.search"
+      EBSOptions:
+        EBSEnabled: True
+        VolumeSize: 20
+        VolumeType: 'gp3'
+      AdvancedSecurityOptions:
+        AnonymousAuthEnabled: False
+        Enabled: True
+        InternalUserDatabaseEnabled: True
+        MasterUserOptions:
+          MasterUserName: !Sub ${OpenSearchUsername}
+          MasterUserPassword: !Sub ${OpenSearchPassword}
+      NodeToNodeEncryptionOptions:
+        Enabled: True
+      EncryptionAtRestOptions:
+        Enabled: True
+        KmsKeyId: alias/aws/es
+      DomainEndpointOptions:
+        EnforceHTTPS: True
+
+Outputs:
+
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch domain endpoint
+    Value:
+      'Fn::GetAtt':
+        - OpenSearchServiceDomain
+        - DomainEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-OpenSearchDomainEndpoint"
+
+  OpenSearchDomainName:
+    Description: OpenSearch domain name
+    Value: !Ref OpenSearchServiceDomain
+    Export:
+      Name: !Sub "${AWS::StackName}-OpenSearchDomainName"
+
+  OpenSearchDashboardURL:
+    Description: OpenSearch domain name
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !GetAtt OpenSearchServiceDomain.DomainEndpoint
+        - '/_dashboards'
+
+  Region:
+    Description: Deployed Region
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+
+  s3BucketTraining:
+    Description: S3 bucket name for training
+    Value: !Ref s3BucketTraining
+
+  s3BucketHostingBucketName:
+    Description: S3 bucket name for frontend hosting
+    Value: !Ref s3BucketHosting
+
+  S3BucketSecureURL:
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !GetAtt
+          - s3BucketHosting
+          - DomainName
+    Description: Name of S3 bucket to hold website content
+
+  SageMakerNotebookURL:
+    Description: SageMaker Notebook Instance
+    Value: !Join
+      - ''
+      - - 'https://console.aws.amazon.com/sagemaker/home?region='
+        - !Ref AWS::Region
+        - '#/notebook-instances/openNotebook/'
+        - !GetAtt NotebookInstance.NotebookInstanceName
+        - '?view=lab'
+
+  OpenSearchSecret:
+    Description: Name of the OpenSearch secret in Secrets Manager
+    Value: !Ref OpenSearchSecret
+
+  BedrockBatchInferenceRole:
+    Description: Bedrock batch inference role
+    Value: !Ref AmazonBedrockBatchInfererenceRole
+
+  BedrockBatchInferenceRoleArn:
+    Description: Bedrock batch inference role ARN
+    Value: !GetAtt AmazonBedrockBatchInfererenceRole.Arn
+
+  NotebookRole:
+    Description: Sagemaker notebook instance role
+    Value: !Ref NBRole
+
+  NotebookRoleArn:
+    Description: Sagemaker Notebook instance role ARN
+    Value: !GetAtt NBRole.Arn
