@@ -1,0 +1,1986 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Observability Blog ETL Pipeline — provisions a fully observable ETL pipeline
+  that reads an XLSX file from S3, transforms it (dropping the region field),
+  and writes output back to S3. Compute paths include AWS Glue and EC2. An MWAA
+  DAG orchestrates both paths. All logs flow through CloudWatch Logs → Kinesis
+  Firehose → Lambda → Amazon OpenSearch Service, queryable via a Bedrock ML
+  connector.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Networking
+        Parameters:
+          - VpcCIDR
+      - Label:
+          default: Infrastructure
+        Parameters:
+          - EC2InstanceType
+    ParameterLabels:
+      VpcCIDR:
+        default: VPC CIDR Block
+      EC2InstanceType:
+        default: EC2 Instance Type
+
+Parameters:
+  EC2InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the ETL script
+
+  VpcCIDR:
+    Type: String
+    Default: 10.192.0.0/16
+    Description: CIDR block for the MWAA VPC
+
+  OpenSearchStackName:
+    Type: String
+    Default: opensearch-cfn
+    Description: Name of the OpenSearch CloudFormation stack (for cross-stack imports)
+
+Conditions: {}
+
+Resources:
+
+  # ===========================================================================
+  # Networking — VPC, Subnets, NAT Gateway, Security Group for MWAA
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # VPC
+  # ---------------------------------------------------------------------------
+  MWAAVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-mwaa-vpc'
+
+  # ---------------------------------------------------------------------------
+  # Internet Gateway (required for NAT Gateway)
+  # ---------------------------------------------------------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref MWAAVpc
+
+  # ---------------------------------------------------------------------------
+  # Public Subnet (hosts the NAT Gateway)
+  # ---------------------------------------------------------------------------
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MWAAVpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCIDR, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MWAAVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------------------------------------------------------------------
+  # NAT Gateway (provides outbound internet for private subnets)
+  # ---------------------------------------------------------------------------
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-gw'
+
+  # ---------------------------------------------------------------------------
+  # Private Subnets (two AZs, required by MWAA)
+  # ---------------------------------------------------------------------------
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MWAAVpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCIDR, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MWAAVpc
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCIDR, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-2'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MWAAVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # Security Group for MWAA (allows outbound HTTPS)
+  # ---------------------------------------------------------------------------
+  MWAASecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MWAA environment
+      VpcId: !Ref MWAAVpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-mwaa-sg'
+
+  MWAASecurityGroupIngressHTTPS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MWAASecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref MWAASecurityGroup
+
+  # ===========================================================================
+  # MWAA DAGs S3 Bucket (versioning enabled — required by MWAA)
+  # ===========================================================================
+  MWAADagsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-mwaa-dags'
+
+  # ===========================================================================
+  # ETL Data S3 Bucket (source data + DLQ for failed log records)
+  # ===========================================================================
+  ETLDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-etl-data'
+
+  # ---------------------------------------------------------------------------
+  # Lambda role for the XLSX file uploader
+  # ---------------------------------------------------------------------------
+  XlsxUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: XlsxUploaderS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${ETLDataBucket.Arn}/*'
+
+  # ---------------------------------------------------------------------------
+  # Lambda — downloads blog_sales_data.xlsx from workshop assets and uploads to S3
+  # ---------------------------------------------------------------------------
+  XlsxUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt XlsxUploaderRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          TARGET_BUCKET: !Ref ETLDataBucket
+          TARGET_KEY: data/blog_sales_data.xlsx
+      Code:
+        ZipFile: |
+          import os
+          import urllib.request
+          import boto3
+          import cfnresponse
+
+          SOURCE_URL = os.environ.get(
+              "XLSX_SOURCE_URL",
+              "https://ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0.s3.us-west-2.amazonaws.com/"
+              "cfda120e-98ef-49df-b875-6f0f33e99615/static/blog_sales_data.xlsx"
+          )
+
+          def handler(event, context):
+              bucket = os.environ["TARGET_BUCKET"]
+              key = os.environ["TARGET_KEY"]
+              request_type = event.get("RequestType", "")
+              try:
+                  s3 = boto3.client("s3")
+                  if request_type in ("Create", "Update"):
+                      tmp_path = "/tmp/blog_sales_data.xlsx"
+                      try:
+                          urllib.request.urlretrieve(SOURCE_URL, tmp_path)
+                          s3.upload_file(tmp_path, bucket, key)
+                      except Exception as download_err:
+                          # Fail gracefully — file may not be available yet
+                          print(f"WARNING: Could not download XLSX file: {download_err}")
+                  elif request_type == "Delete":
+                      try:
+                          s3.delete_object(Bucket=bucket, Key=key)
+                      except Exception:
+                          pass
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as exc:
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED,
+                      {"Reason": str(exc)},
+                  )
+
+  # ---------------------------------------------------------------------------
+  # Custom resource — uploads the XLSX file on stack creation
+  # ---------------------------------------------------------------------------
+  XlsxUploaderResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: ETLDataBucket
+    Properties:
+      ServiceToken: !GetAtt XlsxUploaderFunction.Arn
+
+  # ---------------------------------------------------------------------------
+  # Glue IAM Role
+  # ---------------------------------------------------------------------------
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read the source XLSX file
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ETLDataBucket}/data/blog_sales_data.xlsx'
+              # Write transformed output
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${ETLDataBucket}/output/*'
+              # Read/write Glue scripts and libs (uploaded by custom resource)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ETLDataBucket}/glue-scripts/*'
+                  - !Sub 'arn:aws:s3:::${ETLDataBucket}/glue-libs/*'
+
+  # ---------------------------------------------------------------------------
+  # Lambda role for the Glue script uploader custom resource
+  # ---------------------------------------------------------------------------
+  GlueScriptUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueScriptUploaderS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ETLDataBucket}/glue-scripts/*'
+                  - !Sub 'arn:aws:s3:::${ETLDataBucket}/glue-libs/*'
+
+  # ---------------------------------------------------------------------------
+  # Lambda function — uploads glue_job.py and openpyxl placeholder to S3
+  # ---------------------------------------------------------------------------
+  GlueScriptUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt GlueScriptUploaderRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref ETLDataBucket
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import cfnresponse
+
+          GLUE_SCRIPT_KEY = "glue-scripts/glue_job.py"
+          OPENPYXL_NOTE_KEY = "glue-libs/openpyxl-note.txt"
+
+          GLUE_JOB_SCRIPT = r'''
+          """
+          AWS Glue ETL job script for the Observability Blog ETL Pipeline.
+
+          This script reads an XLSX file from S3, drops the ``region`` field from every
+          record using :func:`transform_records`, and writes the result as JSON back to
+          S3.  It is designed to run inside AWS Glue (where job arguments are resolved
+          via ``awsglue.utils.getResolvedOptions``) but also works as a plain Python
+          script for local testing (arguments are read from ``sys.argv`` in that case).
+
+          Logging is handled via the standard ``logging`` module.  When running inside
+          Glue, the framework automatically routes ``logging`` output to CloudWatch Logs
+          under the job's log group.
+
+          Usage (local / testing)::
+
+              python glue_job.py \
+                  --source_bucket my-bucket \
+                  --xlsx_key data/input.xlsx \
+                  --output_prefix output/
+          """
+
+          from __future__ import annotations
+
+          import json
+          import logging
+          import os
+          import sys
+          import traceback
+          from io import BytesIO
+
+          import boto3
+          import botocore.exceptions
+          import openpyxl
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          def _parse_args_glue(arg_names):
+              from awsglue.utils import getResolvedOptions
+              return getResolvedOptions(sys.argv, arg_names)
+
+          def _parse_args_cli(arg_names):
+              args = {}
+              argv = sys.argv[1:]
+              i = 0
+              while i < len(argv):
+                  token = argv[i]
+                  if token.startswith("--"):
+                      key = token[2:]
+                      if key in arg_names:
+                          if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                              args[key] = argv[i + 1]
+                              i += 2
+                              continue
+                  i += 1
+              missing = [n for n in arg_names if n not in args]
+              if missing:
+                  raise ValueError(f"Missing required arguments: {missing}")
+              return args
+
+          def get_job_args(arg_names):
+              try:
+                  return _parse_args_glue(arg_names)
+              except (ImportError, ModuleNotFoundError):
+                  return _parse_args_cli(arg_names)
+
+          def transform_records(headers, data_rows):
+              headers_lower = [h.lower() for h in headers]
+              if "region" not in headers_lower:
+                  raise ValueError("XLSX file does not contain a 'region' column.")
+              return [
+                  {h: v for h, v in zip(headers, row) if h.lower() != "region"}
+                  for row in data_rows
+              ]
+
+          def run_etl(source_bucket, xlsx_key, output_prefix):
+              s3 = boto3.client("s3")
+              xlsx_filename = os.path.basename(xlsx_key)
+              base_name = os.path.splitext(xlsx_filename)[0]
+              prefix = output_prefix.rstrip("/") + "/" if output_prefix else ""
+              output_key = f"{prefix}{base_name}.json"
+
+              try:
+                  logger.info(json.dumps({
+                      "status": "downloading",
+                      "source_bucket": source_bucket,
+                      "xlsx_key": xlsx_key,
+                  }))
+                  response = s3.get_object(Bucket=source_bucket, Key=xlsx_key)
+                  xlsx_bytes = response["Body"].read()
+              except botocore.exceptions.ClientError as exc:
+                  error_code = exc.response.get("Error", {}).get("Code", "Unknown")
+                  logger.error(json.dumps({
+                      "status": "error",
+                      "error_type": "ClientError",
+                      "error_code": error_code,
+                      "message": str(exc),
+                      "phase": "s3_download",
+                  }))
+                  raise
+
+              try:
+                  wb = openpyxl.load_workbook(BytesIO(xlsx_bytes), read_only=True, data_only=True)
+                  ws = wb.active
+                  rows_iter = ws.iter_rows(values_only=True)
+                  header_row = next(rows_iter, None)
+                  if header_row is None:
+                      raise ValueError("XLSX workbook is empty — no header row found.")
+                  headers = [str(cell) if cell is not None else "" for cell in header_row]
+                  data_rows = list(rows_iter)
+                  records = transform_records(headers, data_rows)
+              except ValueError as exc:
+                  logger.error(json.dumps({
+                      "status": "error",
+                      "error_type": "ValueError",
+                      "message": str(exc),
+                      "phase": "transform",
+                  }))
+                  raise
+              except Exception as exc:
+                  logger.error(json.dumps({
+                      "status": "error",
+                      "error_type": type(exc).__name__,
+                      "message": str(exc),
+                      "stack_trace": traceback.format_exc(),
+                      "phase": "parse_or_transform",
+                  }))
+                  raise
+
+              try:
+                  output_body = json.dumps(records, default=str).encode("utf-8")
+                  s3.put_object(
+                      Bucket=source_bucket,
+                      Key=output_key,
+                      Body=output_body,
+                      ContentType="application/json",
+                  )
+              except botocore.exceptions.ClientError as exc:
+                  error_code = exc.response.get("Error", {}).get("Code", "Unknown")
+                  logger.error(json.dumps({
+                      "status": "error",
+                      "error_type": "ClientError",
+                      "error_code": error_code,
+                      "message": str(exc),
+                      "phase": "s3_upload",
+                  }))
+                  raise
+
+              logger.info(json.dumps({
+                  "status": "success",
+                  "records_written": len(records),
+                  "output_key": output_key,
+              }))
+
+          if __name__ == "__main__":
+              logging.basicConfig(
+                  stream=sys.stdout,
+                  level=logging.INFO,
+                  format="%(asctime)s %(levelname)s %(name)s %(message)s",
+              )
+              _ARG_NAMES = ["source_bucket", "xlsx_key", "output_prefix"]
+              _args = get_job_args(_ARG_NAMES)
+              run_etl(
+                  source_bucket=_args["source_bucket"],
+                  xlsx_key=_args["xlsx_key"],
+                  output_prefix=_args["output_prefix"],
+              )
+          '''
+
+          OPENPYXL_NOTE = (
+              "The openpyxl library must be uploaded as an extracted zip to this location.\n"
+              "Glue --extra-py-files requires the zip to contain importable Python packages.\n"
+              "Build it with:\n"
+              "  pip download openpyxl et_xmlfile --no-deps -d /tmp/openpyxl_pkg\n"
+              "  mkdir /tmp/openpyxl_extract && cd /tmp/openpyxl_extract\n"
+              "  unzip /tmp/openpyxl_pkg/openpyxl-*.whl\n"
+              "  unzip /tmp/openpyxl_pkg/et_xmlfile-*.whl\n"
+              "  zip -r openpyxl.zip openpyxl/ et_xmlfile/\n"
+              "Then upload: aws s3 cp /tmp/openpyxl_extract/openpyxl.zip "
+              "s3://{bucket}/glue-libs/openpyxl.zip\n"
+          )
+
+          def handler(event, context):
+              bucket = os.environ["SOURCE_BUCKET"]
+              request_type = event.get("RequestType", "")
+              try:
+                  s3 = boto3.client("s3")
+                  if request_type in ("Create", "Update"):
+                      # Upload the Glue job script
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=GLUE_SCRIPT_KEY,
+                          Body=GLUE_JOB_SCRIPT.encode("utf-8"),
+                          ContentType="text/x-python",
+                      )
+                      # Upload the openpyxl placeholder note
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=OPENPYXL_NOTE_KEY,
+                          Body=OPENPYXL_NOTE.format(bucket=bucket).encode("utf-8"),
+                          ContentType="text/plain",
+                      )
+                  elif request_type == "Delete":
+                      for key in (GLUE_SCRIPT_KEY, OPENPYXL_NOTE_KEY):
+                          try:
+                              s3.delete_object(Bucket=bucket, Key=key)
+                          except Exception:
+                              pass  # best-effort delete; don't block stack deletion
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as exc:
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED,
+                      {"Reason": str(exc)},
+                  )
+
+  # ---------------------------------------------------------------------------
+  # Custom resource — triggers the uploader Lambda on stack create/update/delete
+  # ---------------------------------------------------------------------------
+  GlueScriptUploaderResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt GlueScriptUploaderFunction.Arn
+      SourceBucket: !Ref ETLDataBucket
+
+  # ---------------------------------------------------------------------------
+  # Glue ETL Job
+  # ---------------------------------------------------------------------------
+  ObservabilityBlogETLJob:
+    Type: AWS::Glue::Job
+    DependsOn: GlueScriptUploaderResource
+    Properties:
+      Name: ObservabilityBlogETL
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${ETLDataBucket}/glue-scripts/glue_job.py'
+        PythonVersion: '3'
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      DefaultArguments:
+        '--source_bucket': !Ref ETLDataBucket
+        '--xlsx_key': 'data/blog_sales_data.xlsx'
+        '--output_prefix': 'output/'
+        '--extra-py-files': !Sub 's3://${ETLDataBucket}/glue-libs/openpyxl.zip'
+        '--job-language': 'python'
+
+  # ---------------------------------------------------------------------------
+  # EC2 IAM Role
+  # ---------------------------------------------------------------------------
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: EC2S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read the source XLSX file
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ETLDataBucket}/data/blog_sales_data.xlsx'
+              # Write transformed output
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${ETLDataBucket}/output/*'
+              # Read EC2 bootstrap scripts
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ETLDataBucket}/ec2-scripts/*'
+
+  # ---------------------------------------------------------------------------
+  # EC2 Instance Profile
+  # ---------------------------------------------------------------------------
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for EC2 ETL
+  # ---------------------------------------------------------------------------
+  EC2ETLLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /observability-blog/ec2-etl
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # EC2 Instance — runs the Python ETL script, bootstrapped via UserData
+  # ---------------------------------------------------------------------------
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: EC2ETLLogGroup
+    Properties:
+      InstanceType: !Ref EC2InstanceType
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: ObservabilityBlogETLInstance
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+
+            # Update system packages and install Python 3 / pip
+            yum update -y
+            yum install -y python3 python3-pip
+
+            # Install required Python libraries
+            pip3 install boto3 openpyxl
+
+            # Install the CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+
+            # Create working directories
+            mkdir -p /opt/etl /var/log/etl
+
+            # Write the ETL script to /opt/etl/etl_script.py
+            cat > /opt/etl/etl_script.py << 'ETLSCRIPT'
+            from __future__ import annotations
+
+            import argparse
+            import json
+            import logging
+            import sys
+            import traceback
+            from io import BytesIO
+
+            import boto3
+            import openpyxl
+
+            def transform_records(headers, rows):
+                headers_lower = [h.lower() for h in headers]
+                if "region" not in headers_lower:
+                    raise ValueError(
+                        f"Required column 'region' not found in headers: {headers!r}"
+                    )
+                result = []
+                for row in rows:
+                    record = {}
+                    for idx, header in enumerate(headers):
+                        if header.lower() == "region":
+                            continue
+                        value = row[idx] if idx < len(row) else None
+                        record[header] = value
+                    result.append(record)
+                return result
+
+            logging.basicConfig(
+                filename="/var/log/etl/etl.log",
+                format="%(asctime)s %(levelname)s %(message)s",
+                level=logging.INFO,
+            )
+
+            _stdout_handler = logging.StreamHandler(sys.stdout)
+            _stdout_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logging.getLogger().addHandler(_stdout_handler)
+
+            logger = logging.getLogger(__name__)
+
+            def _parse_args(argv=None):
+                parser = argparse.ArgumentParser(
+                    description="EC2 ETL script: read XLSX from S3, drop region field, write JSON to S3."
+                )
+                parser.add_argument("--source_bucket", required=True)
+                parser.add_argument("--xlsx_key", required=True)
+                parser.add_argument("--output_prefix", required=True)
+                return parser.parse_args(argv)
+
+            def main(argv=None):
+                args = _parse_args(argv)
+                source_bucket = args.source_bucket
+                xlsx_key = args.xlsx_key
+                output_prefix = args.output_prefix
+
+                try:
+                    s3 = boto3.client("s3")
+
+                    logger.info("Downloading s3://%s/%s", source_bucket, xlsx_key)
+                    response = s3.get_object(Bucket=source_bucket, Key=xlsx_key)
+                    xlsx_bytes = BytesIO(response["Body"].read())
+
+                    wb = openpyxl.load_workbook(xlsx_bytes, read_only=True, data_only=True)
+                    ws = wb.active
+
+                    rows_iter = ws.iter_rows(values_only=True)
+                    headers = [str(cell) if cell is not None else "" for cell in next(rows_iter)]
+                    data_rows = list(rows_iter)
+
+                    records = transform_records(headers, data_rows)
+
+                    basename = xlsx_key.split("/")[-1].replace(".xlsx", ".json")
+                    output_key = f"{output_prefix}{basename}"
+
+                    logger.info("Writing %d records to s3://%s/%s", len(records), source_bucket, output_key)
+                    s3.put_object(
+                        Bucket=source_bucket,
+                        Key=output_key,
+                        Body=json.dumps(records).encode("utf-8"),
+                        ContentType="application/json",
+                    )
+
+                    logger.info(
+                        json.dumps(
+                            {
+                                "status": "success",
+                                "records_written": len(records),
+                                "output_key": output_key,
+                            }
+                        )
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        json.dumps(
+                            {
+                                "status": "error",
+                                "error_type": type(e).__name__,
+                                "message": str(e),
+                                "stack_trace": traceback.format_exc(),
+                            }
+                        )
+                    )
+                    sys.exit(1)
+
+            if __name__ == "__main__":
+                main()
+            ETLSCRIPT
+
+            # Write the CloudWatch agent configuration
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWAGENTCONFIG'
+            {
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/etl/etl.log",
+                        "log_group_name": "/observability-blog/ec2-etl",
+                        "log_stream_name": "{instance_id}",
+                        "timestamp_format": "%Y-%m-%d %H:%M:%S"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            CWAGENTCONFIG
+
+            # Start the CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 -s \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+            # Set environment variables for the ETL script
+            cat >> /etc/environment << 'ENVVARS'
+            ETL_SOURCE_BUCKET=${ETLDataBucket}
+            ETL_XLSX_KEY=data/blog_sales_data.xlsx
+            ENVVARS
+
+  # ---------------------------------------------------------------------------
+  # MWAA Execution Role
+  # ---------------------------------------------------------------------------
+  MWAAExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - airflow.amazonaws.com
+                - airflow-env.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MWAAPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 access to the MWAA DAGs bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:GetAccountPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:GetBucketAcl
+                Resource:
+                  - !Sub 'arn:aws:s3:::${MWAADagsBucket}'
+                  - !Sub 'arn:aws:s3:::${MWAADagsBucket}/*'
+              # S3 account-level public access block check (required by MWAA validation)
+              - Effect: Allow
+                Action:
+                  - s3:GetAccountPublicAccessBlock
+                Resource: '*'
+              # Glue job control
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:GetJob
+                  - glue:BatchStopJobRun
+                Resource: '*'
+              # SSM Run Command for EC2 ETL trigger
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommands
+                Resource: '*'
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:GetLogRecord
+                  - logs:GetQueryResults
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              # CloudWatch metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              # MWAA metrics publishing
+              - Effect: Allow
+                Action:
+                  - airflow:PublishMetrics
+                Resource: '*'
+              # SQS permissions for MWAA internal Celery queue
+              - Effect: Allow
+                Action:
+                  - sqs:ChangeMessageVisibility
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ReceiveMessage
+                  - sqs:SendMessage
+                Resource: !Sub 'arn:aws:sqs:${AWS::Region}:*:airflow-celery-*'
+              # KMS permissions for MWAA encrypted resources
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey*
+                  - kms:Encrypt
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    kms:ViaService:
+                      - !Sub 'sqs.${AWS::Region}.amazonaws.com'
+                      - !Sub 's3.${AWS::Region}.amazonaws.com'
+                      - !Sub 'logs.${AWS::Region}.amazonaws.com'
+
+  # ---------------------------------------------------------------------------
+  # DAG Uploader Lambda Role
+  # ---------------------------------------------------------------------------
+  DAGUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DAGUploaderS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${MWAADagsBucket}/*'
+
+  # ---------------------------------------------------------------------------
+  # DAG Uploader Lambda — uploads observability_etl_dag.py to the MWAA DAGs bucket
+  # ---------------------------------------------------------------------------
+  DAGUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DAGUploaderRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          DAGS_BUCKET: !Ref MWAADagsBucket
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import cfnresponse
+
+          DAG_KEY = "dags/observability_etl_dag.py"
+          REQUIREMENTS_KEY = "requirements/requirements.txt"
+          REQUIREMENTS_CONTENT = "apache-airflow-providers-amazon>=8.0.0\n"
+
+          DAG_CONTENT = r'''
+          """
+          Observability Blog ETL DAG
+
+          Orchestrates two parallel ETL execution paths:
+            1. run_glue_job  — triggers the AWS Glue job 'ObservabilityBlogETL'
+            2. run_ec2_etl   — triggers the Python ETL script on an EC2 instance via
+                               SSM Run Command (or AWS CLI fallback for older Airflow)
+
+          Both tasks run in parallel (no dependency between them).
+          Source bucket and XLSX key are read from Airflow Variables at DAG parse time.
+          """
+
+          from datetime import datetime
+
+          from airflow import DAG
+          from airflow.models import Variable
+
+          try:
+              from airflow.providers.amazon.aws.operators.ssm import SsmRunCommandOperator
+              _USE_SSM_OPERATOR = True
+          except ImportError:
+              from airflow.operators.bash import BashOperator
+              _USE_SSM_OPERATOR = False
+
+          from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
+
+          source_bucket = Variable.get("source_bucket", default_var="")
+          xlsx_key = Variable.get("xlsx_key", default_var="")
+          ec2_instance_id = Variable.get("ec2_instance_id", default_var="")
+
+          with DAG(
+              dag_id="observability_etl_dag",
+              description="Parallel Glue + EC2 ETL orchestration for the observability blog pipeline",
+              schedule_interval=None,
+              start_date=datetime(2024, 1, 1),
+              catchup=False,
+              tags=["observability", "etl"],
+          ) as dag:
+
+              run_glue_job = GlueJobOperator(
+                  task_id="run_glue_job",
+                  job_name="ObservabilityBlogETL",
+                  script_args={
+                      "--source_bucket": source_bucket,
+                      "--xlsx_key": xlsx_key,
+                      "--output_prefix": "output/",
+                  },
+                  aws_conn_id="aws_default",
+                  wait_for_completion=True,
+              )
+
+              _ssm_command = (
+                  f"python3 /opt/etl/etl_script.py "
+                  f"--source_bucket {source_bucket} "
+                  f"--xlsx_key {xlsx_key} "
+                  f"--output_prefix output/"
+              )
+
+              if _USE_SSM_OPERATOR:
+                  run_ec2_etl = SsmRunCommandOperator(
+                      task_id="run_ec2_etl",
+                      instance_ids=[ec2_instance_id],
+                      document_name="AWS-RunShellScript",
+                      parameters={"commands": [_ssm_command]},
+                      aws_conn_id="aws_default",
+                  )
+              else:
+                  run_ec2_etl = BashOperator(
+                      task_id="run_ec2_etl",
+                      bash_command=(
+                          "aws ssm send-command "
+                          f"--instance-ids '{ec2_instance_id}' "
+                          "--document-name 'AWS-RunShellScript' "
+                          f"--parameters 'commands=[\"{_ssm_command}\"]' "
+                          "--output text"
+                      ),
+                  )
+          '''
+
+          def handler(event, context):
+              bucket = os.environ["DAGS_BUCKET"]
+              request_type = event.get("RequestType", "")
+              try:
+                  s3 = boto3.client("s3")
+                  if request_type in ("Create", "Update"):
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=DAG_KEY,
+                          Body=DAG_CONTENT.encode("utf-8"),
+                          ContentType="text/x-python",
+                      )
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=REQUIREMENTS_KEY,
+                          Body=REQUIREMENTS_CONTENT.encode("utf-8"),
+                          ContentType="text/plain",
+                      )
+                  elif request_type == "Delete":
+                      for key in (DAG_KEY, REQUIREMENTS_KEY):
+                          try:
+                              s3.delete_object(Bucket=bucket, Key=key)
+                          except Exception:
+                              pass  # best-effort delete; don't block stack deletion
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as exc:
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED,
+                      {"Reason": str(exc)},
+                  )
+
+  # ---------------------------------------------------------------------------
+  # Custom resource — triggers DAGUploaderFunction on stack create/update/delete
+  # ---------------------------------------------------------------------------
+  DAGUploaderResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DAGUploaderFunction.Arn
+      DagsBucket: !Ref MWAADagsBucket
+
+  # ---------------------------------------------------------------------------
+  # MWAA Environment
+  # ---------------------------------------------------------------------------
+  MWAAEnvironment:
+    Type: AWS::MWAA::Environment
+    DependsOn:
+      - DAGUploaderResource
+      - PrivateRoute
+      - PrivateSubnet1RouteTableAssociation
+      - PrivateSubnet2RouteTableAssociation
+      - MWAASecurityGroupIngressHTTPS
+    Properties:
+      Name: !Sub '${AWS::StackName}-mwaa'
+      AirflowVersion: '2.10.3'
+      SourceBucketArn: !Sub 'arn:aws:s3:::${MWAADagsBucket}'
+      DagS3Path: dags
+      RequirementsS3Path: requirements/requirements.txt
+      ExecutionRoleArn: !GetAtt MWAAExecutionRole.Arn
+      NetworkConfiguration:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref MWAASecurityGroup
+      LoggingConfiguration:
+        DagProcessingLogs:
+          Enabled: true
+          LogLevel: INFO
+        SchedulerLogs:
+          Enabled: true
+          LogLevel: INFO
+        TaskLogs:
+          Enabled: true
+          LogLevel: INFO
+        WebserverLogs:
+          Enabled: true
+          LogLevel: INFO
+        WorkerLogs:
+          Enabled: true
+          LogLevel: INFO
+      WebserverAccessMode: PUBLIC_ONLY
+      AirflowConfigurationOptions:
+        core.default_timezone: utc
+  GlueETLLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws-glue/jobs/ObservabilityBlogETL
+      RetentionInDays: 30
+  MWAATaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/airflow/${AWS::StackName}-mwaa/Task'
+      RetentionInDays: 30
+  GlueAggJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueAggS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ETLDataBucket}/data/blog_sales_data.xlsx'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${ETLDataBucket}/output/agg/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ETLDataBucket}/glue-scripts/*'
+                  - !Sub 'arn:aws:s3:::${ETLDataBucket}/glue-libs/*'
+
+  # ---------------------------------------------------------------------------
+  # Lambda role for the Glue aggregation script uploader
+  # ---------------------------------------------------------------------------
+  GlueAggScriptUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueAggScriptUploaderS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ETLDataBucket}/glue-scripts/*'
+
+  # ---------------------------------------------------------------------------
+  # Lambda — uploads glue_agg_job.py to S3
+  # ---------------------------------------------------------------------------
+  GlueAggScriptUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt GlueAggScriptUploaderRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref ETLDataBucket
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import cfnresponse
+
+          GLUE_SCRIPT_KEY = "glue-scripts/glue_agg_job.py"
+
+          GLUE_AGG_SCRIPT = r'''
+          """
+          AWS Glue Aggregation Job — triggered by MWAA Serverless.
+
+          Reads the same XLSX sales data, computes aggregations
+          (revenue/profit by category, by region, by channel), and writes
+          the summary as JSON to S3 at output/agg/.
+          """
+
+          from __future__ import annotations
+
+          import json
+          import logging
+          import os
+          import sys
+          import traceback
+          from collections import defaultdict
+          from io import BytesIO
+
+          import boto3
+          import botocore.exceptions
+          import openpyxl
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          def _parse_args_glue(arg_names):
+              from awsglue.utils import getResolvedOptions
+              return getResolvedOptions(sys.argv, arg_names)
+
+          def _parse_args_cli(arg_names):
+              args = {}
+              argv = sys.argv[1:]
+              i = 0
+              while i < len(argv):
+                  token = argv[i]
+                  if token.startswith("--"):
+                      key = token[2:]
+                      if key in arg_names:
+                          if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                              args[key] = argv[i + 1]
+                              i += 2
+                              continue
+                  i += 1
+              missing = [n for n in arg_names if n not in args]
+              if missing:
+                  raise ValueError(f"Missing required arguments: {missing}")
+              return args
+
+          def get_job_args(arg_names):
+              try:
+                  return _parse_args_glue(arg_names)
+              except (ImportError, ModuleNotFoundError):
+                  return _parse_args_cli(arg_names)
+
+          def aggregate_records(headers, data_rows):
+              col_idx = {h: i for i, h in enumerate(headers)}
+              required = ["Category", "Region", "Channel", "Revenue", "Profit"]
+              for col in required:
+                  if col not in col_idx:
+                      raise ValueError(f"Required column '{col}' not found. Headers: {headers}")
+
+              by_category = defaultdict(lambda: {"revenue": 0.0, "profit": 0.0, "count": 0})
+              by_region = defaultdict(lambda: {"revenue": 0.0, "profit": 0.0, "count": 0})
+              by_channel = defaultdict(lambda: {"revenue": 0.0, "profit": 0.0, "count": 0})
+
+              for row in data_rows:
+                  category = row[col_idx["Category"]]
+                  region = row[col_idx["Region"]]
+                  channel = row[col_idx["Channel"]]
+                  revenue = float(row[col_idx["Revenue"]] or 0)
+                  profit = float(row[col_idx["Profit"]] or 0)
+
+                  by_category[category]["revenue"] += revenue
+                  by_category[category]["profit"] += profit
+                  by_category[category]["count"] += 1
+
+                  by_region[region]["revenue"] += revenue
+                  by_region[region]["profit"] += profit
+                  by_region[region]["count"] += 1
+
+                  by_channel[channel]["revenue"] += revenue
+                  by_channel[channel]["profit"] += profit
+                  by_channel[channel]["count"] += 1
+
+              return {
+                  "by_category": dict(by_category),
+                  "by_region": dict(by_region),
+                  "by_channel": dict(by_channel),
+                  "total_records": len(data_rows),
+              }
+
+          def run_aggregation(source_bucket, xlsx_key, output_prefix):
+              s3 = boto3.client("s3")
+
+              logger.info(json.dumps({
+                  "status": "downloading",
+                  "source_bucket": source_bucket,
+                  "xlsx_key": xlsx_key,
+              }))
+              response = s3.get_object(Bucket=source_bucket, Key=xlsx_key)
+              xlsx_bytes = response["Body"].read()
+
+              wb = openpyxl.load_workbook(BytesIO(xlsx_bytes), read_only=True, data_only=True)
+              ws = wb.active
+              rows_iter = ws.iter_rows(values_only=True)
+              header_row = next(rows_iter, None)
+              if header_row is None:
+                  raise ValueError("XLSX workbook is empty.")
+              headers = [str(cell) if cell is not None else "" for cell in header_row]
+              data_rows = list(rows_iter)
+
+              logger.info(json.dumps({
+                  "status": "aggregating",
+                  "row_count": len(data_rows),
+              }))
+
+              summary = aggregate_records(headers, data_rows)
+
+              xlsx_filename = os.path.basename(xlsx_key)
+              base_name = os.path.splitext(xlsx_filename)[0]
+              prefix = output_prefix.rstrip("/") + "/" if output_prefix else ""
+              output_key = f"{prefix}{base_name}_summary.json"
+
+              output_body = json.dumps(summary, default=str, indent=2).encode("utf-8")
+              s3.put_object(
+                  Bucket=source_bucket,
+                  Key=output_key,
+                  Body=output_body,
+                  ContentType="application/json",
+              )
+
+              logger.info(json.dumps({
+                  "status": "success",
+                  "aggregation_output_key": output_key,
+                  "total_records_processed": summary["total_records"],
+                  "categories": len(summary["by_category"]),
+                  "regions": len(summary["by_region"]),
+                  "channels": len(summary["by_channel"]),
+              }))
+
+          if __name__ == "__main__":
+              logging.basicConfig(
+                  stream=sys.stdout,
+                  level=logging.INFO,
+                  format="%(asctime)s %(levelname)s %(name)s %(message)s",
+              )
+              _ARG_NAMES = ["source_bucket", "xlsx_key", "output_prefix"]
+              _args = get_job_args(_ARG_NAMES)
+              run_aggregation(
+                  source_bucket=_args["source_bucket"],
+                  xlsx_key=_args["xlsx_key"],
+                  output_prefix=_args["output_prefix"],
+              )
+          '''
+
+          def handler(event, context):
+              bucket = os.environ["SOURCE_BUCKET"]
+              request_type = event.get("RequestType", "")
+              try:
+                  s3 = boto3.client("s3")
+                  if request_type in ("Create", "Update"):
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=GLUE_SCRIPT_KEY,
+                          Body=GLUE_AGG_SCRIPT.encode("utf-8"),
+                          ContentType="text/x-python",
+                      )
+                  elif request_type == "Delete":
+                      try:
+                          s3.delete_object(Bucket=bucket, Key=GLUE_SCRIPT_KEY)
+                      except Exception:
+                          pass
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as exc:
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED,
+                      {"Reason": str(exc)},
+                  )
+
+  # ---------------------------------------------------------------------------
+  # Custom resource — uploads the aggregation Glue script
+  # ---------------------------------------------------------------------------
+  GlueAggScriptUploaderResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt GlueAggScriptUploaderFunction.Arn
+      SourceBucket: !Ref ETLDataBucket
+
+  # ---------------------------------------------------------------------------
+  # Glue Aggregation Job
+  # ---------------------------------------------------------------------------
+  ObservabilityBlogAggJob:
+    Type: AWS::Glue::Job
+    DependsOn: GlueAggScriptUploaderResource
+    Properties:
+      Name: ObservabilityBlogAggregation
+      Role: !GetAtt GlueAggJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${ETLDataBucket}/glue-scripts/glue_agg_job.py'
+        PythonVersion: '3'
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      DefaultArguments:
+        '--source_bucket': !Ref ETLDataBucket
+        '--xlsx_key': 'data/blog_sales_data.xlsx'
+        '--output_prefix': 'output/agg/'
+        '--extra-py-files': !Sub 's3://${ETLDataBucket}/glue-libs/openpyxl.zip'
+        '--job-language': 'python'
+
+  # ---------------------------------------------------------------------------
+  # MWAA Serverless Execution Role
+  # ---------------------------------------------------------------------------
+  MWAAServerlessExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: airflow-serverless.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MWAAServerlessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:GetJob
+                  - glue:BatchStopJobRun
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/ObservabilityBlogAggregation'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt GlueAggJobRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: glue.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogGroups
+                Resource: '*'
+
+  # ---------------------------------------------------------------------------
+  # MWAA Serverless Workflow YAML Uploader Lambda Role
+  # ---------------------------------------------------------------------------
+  MWAAServerlessYAMLUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MWAAServerlessYAMLUploaderS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${ETLDataBucket}/mwaa-serverless/*'
+
+  # ---------------------------------------------------------------------------
+  # Lambda — uploads the MWAA Serverless workflow YAML to S3
+  # ---------------------------------------------------------------------------
+  MWAAServerlessYAMLUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt MWAAServerlessYAMLUploaderRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref ETLDataBucket
+          XLSX_KEY: data/blog_sales_data.xlsx
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import cfnresponse
+
+          WORKFLOW_YAML = """observability_blog_aggregation:
+            dag_id: observability_blog_aggregation
+            schedule: null
+            tasks:
+              run_aggregation_job:
+                operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+                job_name: ObservabilityBlogAggregation
+                script_args:
+                  --source_bucket: "{source_bucket}"
+                  --xlsx_key: "{xlsx_key}"
+                  --output_prefix: "output/agg/"
+                wait_for_completion: true
+                task_id: run_aggregation_job
+                dependencies: []
+          """
+
+          WORKFLOW_S3_KEY = "mwaa-serverless/aggregation_workflow.yaml"
+
+          def handler(event, context):
+              source_bucket = os.environ["SOURCE_BUCKET"]
+              xlsx_key = os.environ["XLSX_KEY"]
+              request_type = event.get("RequestType", "")
+
+              try:
+                  s3 = boto3.client("s3")
+                  if request_type in ("Create", "Update"):
+                      workflow_content = WORKFLOW_YAML.format(
+                          source_bucket=source_bucket,
+                          xlsx_key=xlsx_key,
+                      )
+                      s3.put_object(
+                          Bucket=source_bucket,
+                          Key=WORKFLOW_S3_KEY,
+                          Body=workflow_content.encode("utf-8"),
+                          ContentType="text/yaml",
+                      )
+                  elif request_type == "Delete":
+                      try:
+                          s3.delete_object(Bucket=source_bucket, Key=WORKFLOW_S3_KEY)
+                      except Exception:
+                          pass
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as exc:
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED,
+                      {"Reason": str(exc)},
+                  )
+
+  # ---------------------------------------------------------------------------
+  # Custom resource — uploads the workflow YAML to S3
+  # ---------------------------------------------------------------------------
+  MWAAServerlessYAMLUploaderResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt MWAAServerlessYAMLUploaderFunction.Arn
+      SourceBucket: !Ref ETLDataBucket
+
+  # ---------------------------------------------------------------------------
+  # MWAA Serverless Workflow (native CFN resource)
+  # ---------------------------------------------------------------------------
+  MWAAServerlessWorkflow:
+    Type: AWS::MWAAServerless::Workflow
+    DependsOn:
+      - ObservabilityBlogAggJob
+      - MWAAServerlessYAMLUploaderResource
+    Properties:
+      Name: !Sub '${AWS::StackName}-serverless-agg'
+      Description: 'Observability Blog — aggregation ETL via MWAA Serverless'
+      DefinitionS3Location:
+        Bucket: !Ref ETLDataBucket
+        ObjectKey: mwaa-serverless/aggregation_workflow.yaml
+      RoleArn: !GetAtt MWAAServerlessExecutionRole.Arn
+      LoggingConfiguration:
+        LogGroupName: !Sub '/aws/mwaa-serverless/${AWS::StackName}-serverless-agg'
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for MWAA Serverless workflow
+  # ---------------------------------------------------------------------------
+  MWAAServerlessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/mwaa-serverless/${AWS::StackName}-serverless-agg'
+      RetentionInDays: 30
+  GlueAggLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws-glue/jobs/ObservabilityBlogAggregation
+      RetentionInDays: 30
+
+  # ===========================================================================
+  # CloudWatch Logs → Lambda → OpenSearch (Subscription Filter Pipeline)
+  # ===========================================================================
+
+  CWLtoOpenSearchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OpenSearchWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: !Sub
+                  - 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*'
+                  - DomainName: !ImportValue
+                      Fn::Sub: '${OpenSearchStackName}-OpenSearchDomainName'
+
+  CWLtoOpenSearchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CWLtoOpenSearch
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CWLtoOpenSearchRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !Sub
+            - 'https://${Endpoint}'
+            - Endpoint: !ImportValue
+                Fn::Sub: '${OpenSearchStackName}-OpenSearchDomainEndpoint'
+      Code:
+        ZipFile: |
+          import base64
+          import gzip
+          import json
+          import os
+          import datetime
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          OPENSEARCH_ENDPOINT = os.environ["OPENSEARCH_ENDPOINT"]
+          REGION = os.environ["AWS_REGION"]
+
+          def get_credentials():
+              session = boto3.Session()
+              return session.get_credentials().get_frozen_credentials()
+
+          def sign_request(method, url, body, region, service="es"):
+              creds = get_credentials()
+              request = AWSRequest(method=method, url=url, data=body, headers={"Content-Type": "application/json"})
+              SigV4Auth(creds, service, region).add_auth(request)
+              return dict(request.headers)
+
+          def handler(event, context):
+              compressed = base64.b64decode(event["awslogs"]["data"])
+              payload = json.loads(gzip.decompress(compressed))
+
+              if payload.get("messageType") == "CONTROL_MESSAGE":
+                  return {"statusCode": 200, "body": "Control message ignored"}
+
+              log_group = payload.get("logGroup", "unknown")
+              log_stream = payload.get("logStream", "unknown")
+              log_events = payload.get("logEvents", [])
+
+              if not log_events:
+                  return {"statusCode": 200, "body": "No log events"}
+
+              today = datetime.datetime.utcnow().strftime("%Y.%m.%d")
+              index_name = f"cwl-{today}"
+
+              bulk_body = ""
+              for evt in log_events:
+                  doc = {
+                      "@timestamp": datetime.datetime.utcfromtimestamp(evt["timestamp"] / 1000).isoformat() + "Z",
+                      "message": evt.get("message", ""),
+                      "log_group": log_group,
+                      "log_stream": log_stream,
+                      "id": evt.get("id", "")
+                  }
+                  try:
+                      parsed = json.loads(evt["message"])
+                      if isinstance(parsed, dict):
+                          doc.update(parsed)
+                  except (json.JSONDecodeError, TypeError):
+                      pass
+                  bulk_body += json.dumps({"index": {"_index": index_name}}) + chr(10)
+                  bulk_body += json.dumps(doc) + chr(10)
+
+              url = f"{OPENSEARCH_ENDPOINT}/_bulk"
+              headers = sign_request("POST", url, bulk_body, REGION)
+              req = Request(url, data=bulk_body.encode("utf-8"), headers=headers, method="POST")
+              try:
+                  with urlopen(req) as resp:
+                      response_body = json.loads(resp.read())
+                      if response_body.get("errors"):
+                          print(f"Bulk indexing had errors: {json.dumps(response_body)}")
+                      return {"statusCode": 200, "body": f"Indexed {len(log_events)} events to {index_name}"}
+              except HTTPError as e:
+                  print(f"OpenSearch bulk request failed: {e.code} {e.read().decode()}")
+                  raise
+
+  # --- Lambda Invoke Permissions (one per log group) ---
+  CWLPermissionEC2ETL:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/observability-blog/ec2-etl:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionMWAATask:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/airflow/${AWS::StackName}-mwaa/Task:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionGlueETL:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/ObservabilityBlogETL:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionGlueAgg:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/ObservabilityBlogAggregation:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionGlueError:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/error:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionGlueLogsV2:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/logs-v2:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionMWAAServerless:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/mwaa-serverless/${AWS::StackName}-serverless-agg:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionMWAAScheduler:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-mwaa-Scheduler:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionMWAAWorker:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-mwaa-Worker:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionMWAADAGProcessing:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-mwaa-DAGProcessing:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  CWLPermissionMWAAWebServer:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-mwaa-WebServer:*'
+      SourceAccount: !Ref AWS::AccountId
+
+  # --- Subscription Filters ---
+  SubscriptionFilterEC2ETL:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: CWLPermissionEC2ETL
+    Properties:
+      LogGroupName: !Ref EC2ETLLogGroup
+      FilterName: OpenSearchObservabilityFilter
+      FilterPattern: ''
+      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
+
+  SubscriptionFilterMWAATask:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: [CWLPermissionMWAATask, MWAAEnvironment]
+    Properties:
+      LogGroupName: !Ref MWAATaskLogGroup
+      FilterName: OpenSearchObservabilityFilter
+      FilterPattern: ''
+      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
+
+  SubscriptionFilterGlueETL:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: CWLPermissionGlueETL
+    Properties:
+      LogGroupName: !Ref GlueETLLogGroup
+      FilterName: OpenSearchObservabilityFilter
+      FilterPattern: ''
+      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
+
+  SubscriptionFilterGlueAgg:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: CWLPermissionGlueAgg
+    Properties:
+      LogGroupName: !Ref GlueAggLogGroup
+      FilterName: OpenSearchObservabilityFilter
+      FilterPattern: ''
+      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
+
+  SubscriptionFilterMWAAServerless:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: CWLPermissionMWAAServerless
+    Properties:
+      LogGroupName: !Ref MWAAServerlessLogGroup
+      FilterName: OpenSearchObservabilityFilter
+      FilterPattern: ''
+      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
+
+Outputs:
+  GlueJobName:
+    Description: Name of the Glue ETL job
+    Value: !Ref ObservabilityBlogETLJob
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueJobName'
+
+  EC2InstanceId:
+    Description: EC2 instance ID running the Python ETL script
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2InstanceId'
+
+  MWAAEnvironmentName:
+    Description: MWAA environment name
+    Value: !Ref MWAAEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-MWAAEnvironmentName'
+  ETLDataBucketName:
+    Description: S3 bucket name for ETL data and log DLQ
+    Value: !Ref ETLDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ETLDataBucketName'
+
+  MWAADagsBucketName:
+    Description: S3 bucket name for MWAA DAG files
+    Value: !Ref MWAADagsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-MWAADagsBucketName'
+
+  MWAAServerlessWorkflowArn:
+    Description: MWAA Serverless workflow ARN for the aggregation pipeline
+    Value: !GetAtt MWAAServerlessWorkflow.WorkflowArn
+    Export:
+      Name: !Sub '${AWS::StackName}-MWAAServerlessWorkflowArn'
+
+  GlueAggJobName:
+    Description: Name of the Glue Aggregation job (triggered by MWAA Serverless)
+    Value: !Ref ObservabilityBlogAggJob
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueAggJobName'
