@@ -42,8 +42,6 @@ awsAccountConfig:
   participantRole:
     managedPolicies:
       - "arn:aws:iam::aws:policy/IAMReadOnlyAccess"
-    iamPolicies:
-      - "assets/cfn/teampolicy.json"
     trustedPrincipals:
       service:
         - ec2.amazonaws.com

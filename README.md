@@ -18,8 +18,6 @@ By the end of this guide you will have:
 - An Amazon Bedrock ML connector registered in OpenSearch for LLM-based analysis
 - An OpenSearch MCP server, hosted on Amazon Bedrock AgentCore, that lets an AI assistant query your logs in natural language
 
-> This blog is the write-up of a hands-on workshop. The three CloudFormation templates that provision everything described here live in [`assets/cfn/`](assets/cfn/): `opensearch_cfn.yaml`, `agentcore-mcp-server.yaml`, and `etl.yaml`. The step-by-step lab instructions live under [`content/`](content/).
-
 ---
 
 ## 2. Architecture Overview
@@ -93,10 +91,6 @@ This solution provisions and uses the following services:
 - **Amazon SageMaker** — a notebook instance used to drive the workshop and register the ML connector
 - **Amazon Cognito** — authentication for the AgentCore-hosted MCP server
 - **AWS Secrets Manager** — stores the OpenSearch master-user credentials
-
-### Supported Regions
-
-Deployable in **us-west-2** (Oregon) or **us-east-1** (N. Virginia). All services used (OpenSearch, MWAA, Bedrock AgentCore, SageMaker) are available in these regions.
 
 ### Deployment Model
 
@@ -269,7 +263,7 @@ Because FGAC is enabled, the domain's resource-based access policy is intentiona
 
 The OpenSearch **master-user credentials** (username and password) are stored in an AWS Secrets Manager secret created by `opensearch_cfn.yaml`. This is what the notebook and the forwarding path use to authenticate to the domain. The domain **endpoint** itself is not a secret — it is published as a CloudFormation output/export and passed to the MCP server as the `OPENSEARCH_URL` environment variable.
 
-> Security note: This workshop ships a default OpenSearch password (`OpenSearchPassword` parameter) for convenience in ephemeral event accounts. In any long-lived environment, override it with a strong value and do not rely on the default. See `assets/cfn/SECURITY_DECISIONS.md` for the participant-policy posture and the accepted-risk rationale for the workshop's IAM scoping.
+> Security note: The `OpenSearchPassword` parameter has no default — you must supply a strong password at deploy time, and it is never stored in source control. The parameter is declared `NoEcho` and enforces a length/complexity pattern. The CloudFormation stacks provision their own scoped service and execution roles (MWAA execution role, notebook role, Bedrock inference role, and so on); review and tighten these to your organization's least-privilege requirements before deploying into a production account.
 
 ---
 
@@ -343,8 +337,7 @@ For the complete tool reference and advanced configuration, see the [`opensearch
 
 ## 9. Clean Up
 
-This solution creates resources that incur cost — the OpenSearch domain, the MWAA environment, the SageMaker notebook, and a NAT Gateway are the primary drivers. When you are finished, delete the three CloudFormation stacks (in reverse dependency order: the ETL stack and MCP-server stack first, then the OpenSearch stack) to stop charges. Empty any S3 buckets that block stack deletion. Detailed steps are in [`content/5 Clean Up/`](content/5%20Clean%20Up/).
-
+This solution creates resources that incur cost — the OpenSearch domain, the MWAA environment, the SageMaker notebook, and a NAT Gateway are the primary drivers. When you are finished, delete the three CloudFormation stacks (in reverse dependency order: the ETL stack and MCP-server stack first, then the OpenSearch stack) to stop charges. Empty any S3 buckets that block stack deletion.
 ---
 
 ## 10. Conclusion
@@ -368,8 +361,6 @@ This guide built an observability layer for an MWAA-orchestrated ETL pipeline wi
 | `assets/cfn/opensearch_cfn.yaml` | Stack 1 — OpenSearch domain + SageMaker notebook |
 | `assets/cfn/agentcore-mcp-server.yaml` | Stack 2 — OpenSearch MCP server on Bedrock AgentCore |
 | `assets/cfn/etl.yaml` | Stack 3 — MWAA + Glue + EC2 ETL pipeline |
-| `assets/cfn/teampolicy.json` | Scoped participant IAM policy |
-| `assets/cfn/SECURITY_DECISIONS.md` | Security posture and accepted-risk rationale |
 | `assets/Lab-OpenSearch-Observability-v2.ipynb` | Workshop lab notebook |
 | `content/` | Step-by-step workshop instructions |
 | `ObservabilityArchitecture.drawio.png` | Architecture diagram |
