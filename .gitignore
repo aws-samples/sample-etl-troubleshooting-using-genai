@@ -22,3 +22,6 @@ build/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Kiro specs — local only, not published to the remote
+specs/
