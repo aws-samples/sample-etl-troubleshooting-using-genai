@@ -361,6 +361,6 @@ This guide built an observability layer for an MWAA-orchestrated ETL pipeline wi
 | `assets/cfn/opensearch_cfn.yaml` | Stack 1 — OpenSearch domain + SageMaker notebook |
 | `assets/cfn/agentcore-mcp-server.yaml` | Stack 2 — OpenSearch MCP server on Bedrock AgentCore |
 | `assets/cfn/etl.yaml` | Stack 3 — MWAA + Glue + EC2 ETL pipeline |
-| `assets/Lab-OpenSearch-Observability-v2.ipynb` | Workshop lab notebook |
+| `assets/Lab-OpenSearch-Observability.ipynb` | Workshop lab notebook |
 | `content/` | Step-by-step workshop instructions |
 | `ObservabilityArchitecture.drawio.png` | Architecture diagram |
