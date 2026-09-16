@@ -27,12 +27,11 @@ Parameters:
     Type: String
   OpenSearchPassword:
     AllowedPattern: '(?=^.{8,32}$)((?=.*\d)(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[^A-Za-z0-9])(?=.*[a-z])|(?=.*[^A-Za-z0-9])(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[A-Z])(?=.*[^A-Za-z0-9]))^.*'
-    Description: Password for the account named above. Must be at least 8 characters containing letters, numbers and symbols
+    Description: Password for the account named above. Must be 8-32 characters containing letters, numbers and symbols. No default is provided; you must supply a value at deploy time.
     MaxLength: '32'
     MinLength: '8'
     NoEcho: 'true'
     Type: String
-    Default: Semantic123!
   LambdaTimeout:
     Type: Number
     Default: 120

@@ -21,8 +21,8 @@ infrastructure:
         # magic vars
         - templateParameter: OpenSearchUsername
           defaultValue: "admin"
+        # No defaultValue: participants are prompted to enter a password at deploy time.
         - templateParameter: OpenSearchPassword
-          defaultValue: "Semantic123!"
     - templateLocation: assets/cfn/agentcore-mcp-server.yaml
       label: OpenSearch MCP Server
       participantAllStackOutputsVisible: true
