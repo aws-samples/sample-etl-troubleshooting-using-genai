@@ -22,7 +22,7 @@ To access your account, complete the following steps.
   
 :::alert{header="Important" type="warning"}
 Troubleshooting
-If you don't receive an email, please check your spam folder. Alternatively, please check with your event facilitator to ensure your email has been whitelisted.
+If you don't receive an email, please check your spam folder. Alternatively, please check with your event facilitator to ensure your email has been allowlisted.
 
 :::
     

@@ -14,7 +14,7 @@ params:
 # START Infrastructure
 infrastructure:
   cloudformationTemplates:
-    - templateLocation: static/templates/opensearch_cfn.yaml
+    - templateLocation: assets/cfn/opensearch_cfn.yaml
       label: Vector Search with RAG using OpenSearch
       participantAllStackOutputsVisible: true
       parameters:
@@ -23,10 +23,10 @@ infrastructure:
           defaultValue: "admin"
         - templateParameter: OpenSearchPassword
           defaultValue: "Semantic123!"
-    - templateLocation: static/templates/agentcore-mcp-server.yaml
+    - templateLocation: assets/cfn/agentcore-mcp-server.yaml
       label: OpenSearch MCP Server
       participantAllStackOutputsVisible: true
-    - templateLocation: static/templates/etl.yaml
+    - templateLocation: assets/cfn/etl.yaml
       label: Observability ETL Pipeline
       participantAllStackOutputsVisible: true
     
@@ -38,10 +38,12 @@ awsAccountConfig:
     - WorkshopStudio
   serviceLinkedRoles:
     - appsync.amazonaws.com
+    - bedrock-agentcore.amazonaws.com
   participantRole:
     managedPolicies:
       - "arn:aws:iam::aws:policy/IAMReadOnlyAccess"
-      - "arn:aws:iam::aws:policy/AdministratorAccess"
+    iamPolicies:
+      - "assets/cfn/teampolicy.json"
     trustedPrincipals:
       service:
         - ec2.amazonaws.com

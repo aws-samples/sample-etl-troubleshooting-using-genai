@@ -3,9 +3,7 @@ Description: >
   Observability Blog ETL Pipeline — provisions a fully observable ETL pipeline
   that reads an XLSX file from S3, transforms it (dropping the region field),
   and writes output back to S3. Compute paths include AWS Glue and EC2. An MWAA
-  DAG orchestrates both paths. All logs flow through CloudWatch Logs → Kinesis
-  Firehose → Lambda → Amazon OpenSearch Service, queryable via a Bedrock ML
-  connector.
+  DAG orchestrates both paths.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -35,10 +33,12 @@ Parameters:
     Default: 10.192.0.0/16
     Description: CIDR block for the MWAA VPC
 
-  OpenSearchStackName:
-    Type: String
-    Default: opensearch-cfn
-    Description: Name of the OpenSearch CloudFormation stack (for cross-stack imports)
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: Timeout in seconds for Lambda functions used in custom resources
+    MinValue: 30
+    MaxValue: 900
 
 Conditions: {}
 
@@ -53,6 +53,8 @@ Resources:
   # ---------------------------------------------------------------------------
   MWAAVpc:
     Type: AWS::EC2::VPC
+    Metadata:
+      Description: "VPC for the MWAA environment with DNS support enabled"
     Properties:
       CidrBlock: !Ref VpcCIDR
       EnableDnsSupport: true
@@ -66,6 +68,8 @@ Resources:
   # ---------------------------------------------------------------------------
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    Metadata:
+      Description: "Internet gateway providing outbound connectivity for public subnet"
     Properties:
       Tags:
         - Key: Name
@@ -73,6 +77,8 @@ Resources:
 
   InternetGatewayAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
+    Metadata:
+      Description: "Attaches the internet gateway to the MWAA VPC"
     Properties:
       InternetGatewayId: !Ref InternetGateway
       VpcId: !Ref MWAAVpc
@@ -82,6 +88,8 @@ Resources:
   # ---------------------------------------------------------------------------
   PublicSubnet:
     Type: AWS::EC2::Subnet
+    Metadata:
+      Description: "Public subnet hosting the NAT gateway for outbound internet access"
     Properties:
       VpcId: !Ref MWAAVpc
       CidrBlock: !Select [0, !Cidr [!Ref VpcCIDR, 4, 8]]
@@ -93,6 +101,8 @@ Resources:
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
+    Metadata:
+      Description: "Route table for the public subnet with internet gateway route"
     Properties:
       VpcId: !Ref MWAAVpc
       Tags:
@@ -101,6 +111,8 @@ Resources:
 
   PublicRoute:
     Type: AWS::EC2::Route
+    Metadata:
+      Description: "Default route to the internet via the internet gateway"
     DependsOn: InternetGatewayAttachment
     Properties:
       RouteTableId: !Ref PublicRouteTable
@@ -109,6 +121,8 @@ Resources:
 
   PublicSubnetRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
+    Metadata:
+      Description: "Associates the public subnet with the public route table"
     Properties:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
@@ -118,12 +132,16 @@ Resources:
   # ---------------------------------------------------------------------------
   NatGatewayEIP:
     Type: AWS::EC2::EIP
+    Metadata:
+      Description: "Elastic IP address allocated for the NAT gateway"
     DependsOn: InternetGatewayAttachment
     Properties:
       Domain: vpc
 
   NatGateway:
     Type: AWS::EC2::NatGateway
+    Metadata:
+      Description: "NAT gateway providing outbound internet for private subnets"
     Properties:
       AllocationId: !GetAtt NatGatewayEIP.AllocationId
       SubnetId: !Ref PublicSubnet
@@ -136,6 +154,8 @@ Resources:
   # ---------------------------------------------------------------------------
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
+    Metadata:
+      Description: "First private subnet for the MWAA environment (AZ 1)"
     Properties:
       VpcId: !Ref MWAAVpc
       CidrBlock: !Select [1, !Cidr [!Ref VpcCIDR, 4, 8]]
@@ -146,6 +166,8 @@ Resources:
 
   PrivateSubnet2:
     Type: AWS::EC2::Subnet
+    Metadata:
+      Description: "Second private subnet for the MWAA environment (AZ 2)"
     Properties:
       VpcId: !Ref MWAAVpc
       CidrBlock: !Select [2, !Cidr [!Ref VpcCIDR, 4, 8]]
@@ -156,6 +178,8 @@ Resources:
 
   PrivateRouteTable:
     Type: AWS::EC2::RouteTable
+    Metadata:
+      Description: "Route table for private subnets with NAT gateway route"
     Properties:
       VpcId: !Ref MWAAVpc
       Tags:
@@ -164,6 +188,8 @@ Resources:
 
   PrivateRoute:
     Type: AWS::EC2::Route
+    Metadata:
+      Description: "Default route to the internet via the NAT gateway"
     Properties:
       RouteTableId: !Ref PrivateRouteTable
       DestinationCidrBlock: 0.0.0.0/0
@@ -171,12 +197,16 @@ Resources:
 
   PrivateSubnet1RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
+    Metadata:
+      Description: "Associates private subnet 1 with the private route table"
     Properties:
       SubnetId: !Ref PrivateSubnet1
       RouteTableId: !Ref PrivateRouteTable
 
   PrivateSubnet2RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
+    Metadata:
+      Description: "Associates private subnet 2 with the private route table"
     Properties:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
@@ -186,6 +216,8 @@ Resources:
   # ---------------------------------------------------------------------------
   MWAASecurityGroup:
     Type: AWS::EC2::SecurityGroup
+    Metadata:
+      Description: "Security group for the MWAA environment allowing self-referencing ingress"
     Properties:
       GroupDescription: Security group for MWAA environment
       VpcId: !Ref MWAAVpc
@@ -198,16 +230,63 @@ Resources:
 
   MWAASecurityGroupIngressHTTPS:
     Type: AWS::EC2::SecurityGroupIngress
+    Metadata:
+      Description: "Ingress rule allowing all traffic within the MWAA security group"
     Properties:
       GroupId: !Ref MWAASecurityGroup
       IpProtocol: '-1'
       SourceSecurityGroupId: !Ref MWAASecurityGroup
 
   # ===========================================================================
+  # S3 Access Logs Bucket (receives server access logs from the other buckets)
+  # ===========================================================================
+  S3AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      Description: "Destination bucket for S3 server access logs"
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-s3-access-logs'
+
+  S3AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${S3AccessLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ===========================================================================
   # MWAA DAGs S3 Bucket (versioning enabled — required by MWAA)
   # ===========================================================================
   MWAADagsBucket:
     Type: AWS::S3::Bucket
+    Metadata:
+      Description: "S3 bucket for MWAA DAG files with versioning enabled"
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -215,6 +294,14 @@ Resources:
               SSEAlgorithm: AES256
       VersioningConfiguration:
         Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogsBucket
+        LogFilePrefix: mwaa-dags/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-mwaa-dags'
@@ -224,6 +311,8 @@ Resources:
   # ===========================================================================
   ETLDataBucket:
     Type: AWS::S3::Bucket
+    Metadata:
+      Description: "S3 bucket for ETL source data and output files"
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -231,6 +320,14 @@ Resources:
               SSEAlgorithm: AES256
       VersioningConfiguration:
         Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogsBucket
+        LogFilePrefix: etl-data/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-etl-data'
@@ -240,6 +337,8 @@ Resources:
   # ---------------------------------------------------------------------------
   XlsxUploaderRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for the Lambda that uploads the sample XLSX data file"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -266,11 +365,13 @@ Resources:
   # ---------------------------------------------------------------------------
   XlsxUploaderFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      Description: "Lambda function that downloads and uploads the sample XLSX file to S3"
     Properties:
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt XlsxUploaderRole.Arn
-      Timeout: 120
+      Timeout: !Ref LambdaTimeout
       Environment:
         Variables:
           TARGET_BUCKET: !Ref ETLDataBucket
@@ -319,6 +420,8 @@ Resources:
   # ---------------------------------------------------------------------------
   XlsxUploaderResource:
     Type: AWS::CloudFormation::CustomResource
+    Metadata:
+      Description: "Custom resource triggering the XLSX file upload on stack creation"
     DependsOn: ETLDataBucket
     Properties:
       ServiceToken: !GetAtt XlsxUploaderFunction.Arn
@@ -328,6 +431,8 @@ Resources:
   # ---------------------------------------------------------------------------
   GlueJobRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for the Glue ETL job with scoped S3 access"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -365,6 +470,8 @@ Resources:
   # ---------------------------------------------------------------------------
   GlueScriptUploaderRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for the Lambda that uploads Glue job scripts"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -393,11 +500,13 @@ Resources:
   # ---------------------------------------------------------------------------
   GlueScriptUploaderFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      Description: "Lambda function that uploads the Glue ETL script and dependencies to S3"
     Properties:
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt GlueScriptUploaderRole.Arn
-      Timeout: 300
+      Timeout: !Ref LambdaTimeout
       Environment:
         Variables:
           SOURCE_BUCKET: !Ref ETLDataBucket
@@ -631,6 +740,8 @@ Resources:
   # ---------------------------------------------------------------------------
   GlueScriptUploaderResource:
     Type: AWS::CloudFormation::CustomResource
+    Metadata:
+      Description: "Custom resource triggering Glue script upload on stack creation"
     Properties:
       ServiceToken: !GetAtt GlueScriptUploaderFunction.Arn
       SourceBucket: !Ref ETLDataBucket
@@ -640,6 +751,8 @@ Resources:
   # ---------------------------------------------------------------------------
   ObservabilityBlogETLJob:
     Type: AWS::Glue::Job
+    Metadata:
+      Description: "AWS Glue ETL job that transforms XLSX data by removing the region field"
     DependsOn: GlueScriptUploaderResource
     Properties:
       Name: ObservabilityBlogETL
@@ -663,6 +776,8 @@ Resources:
   # ---------------------------------------------------------------------------
   EC2InstanceRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for the EC2 ETL instance with S3 and SSM access"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -697,6 +812,8 @@ Resources:
   # ---------------------------------------------------------------------------
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
+    Metadata:
+      Description: "Instance profile attaching the EC2 ETL role to the instance"
     Properties:
       Roles:
         - !Ref EC2InstanceRole
@@ -706,6 +823,8 @@ Resources:
   # ---------------------------------------------------------------------------
   EC2ETLLogGroup:
     Type: AWS::Logs::LogGroup
+    Metadata:
+      Description: "CloudWatch Logs group for EC2 ETL script output"
     Properties:
       LogGroupName: /observability-blog/ec2-etl
       RetentionInDays: 30
@@ -715,6 +834,8 @@ Resources:
   # ---------------------------------------------------------------------------
   EC2Instance:
     Type: AWS::EC2::Instance
+    Metadata:
+      Description: "EC2 instance running the Python ETL script with CloudWatch agent"
     DependsOn: EC2ETLLogGroup
     Properties:
       InstanceType: !Ref EC2InstanceType
@@ -890,6 +1011,14 @@ Resources:
   # ---------------------------------------------------------------------------
   MWAAExecutionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM execution role for the MWAA environment with scoped service access"
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "cloudwatch:PutMetricData does not support resource-level permissions"
+          - id: CKV_AWS_109
+            comment: "s3:GetAccountPublicAccessBlock requires Resource:* per AWS documentation"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -934,14 +1063,19 @@ Resources:
                   - glue:GetJobRuns
                   - glue:GetJob
                   - glue:BatchStopJobRun
-                Resource: '*'
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/ObservabilityBlogETL'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/ObservabilityBlogAggregation'
               # SSM Run Command for EC2 ETL trigger
               - Effect: Allow
                 Action:
                   - ssm:SendCommand
                   - ssm:GetCommandInvocation
                   - ssm:ListCommands
-                Resource: '*'
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:*'
+                  - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript'
               # CloudWatch Logs
               - Effect: Allow
                 Action:
@@ -952,17 +1086,23 @@ Resources:
                   - logs:GetLogRecord
                   - logs:GetQueryResults
                   - logs:DescribeLogGroups
-                Resource: '*'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-*:*'
               # CloudWatch metrics
               - Effect: Allow
                 Action:
                   - cloudwatch:PutMetricData
                 Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'AmazonMWAA'
               # MWAA metrics publishing
               - Effect: Allow
                 Action:
                   - airflow:PublishMetrics
-                Resource: '*'
+                Resource:
+                  - !Sub 'arn:aws:airflow:${AWS::Region}:${AWS::AccountId}:environment/${AWS::StackName}-mwaa'
               # SQS permissions for MWAA internal Celery queue
               - Effect: Allow
                 Action:
@@ -993,6 +1133,8 @@ Resources:
   # ---------------------------------------------------------------------------
   DAGUploaderRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for the Lambda that uploads DAG files to MWAA"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1019,11 +1161,13 @@ Resources:
   # ---------------------------------------------------------------------------
   DAGUploaderFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      Description: "Lambda function that uploads the observability ETL DAG to S3"
     Properties:
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt DAGUploaderRole.Arn
-      Timeout: 300
+      Timeout: !Ref LambdaTimeout
       Environment:
         Variables:
           DAGS_BUCKET: !Ref MWAADagsBucket
@@ -1153,6 +1297,8 @@ Resources:
   # ---------------------------------------------------------------------------
   DAGUploaderResource:
     Type: AWS::CloudFormation::CustomResource
+    Metadata:
+      Description: "Custom resource triggering DAG upload on stack creation"
     Properties:
       ServiceToken: !GetAtt DAGUploaderFunction.Arn
       DagsBucket: !Ref MWAADagsBucket
@@ -1162,6 +1308,8 @@ Resources:
   # ---------------------------------------------------------------------------
   MWAAEnvironment:
     Type: AWS::MWAA::Environment
+    Metadata:
+      Description: "Amazon MWAA environment orchestrating the ETL pipeline"
     DependsOn:
       - DAGUploaderResource
       - PrivateRoute
@@ -1200,18 +1348,27 @@ Resources:
       WebserverAccessMode: PUBLIC_ONLY
       AirflowConfigurationOptions:
         core.default_timezone: utc
+
   GlueETLLogGroup:
     Type: AWS::Logs::LogGroup
+    Metadata:
+      Description: "CloudWatch Logs group for the Glue ETL job"
     Properties:
       LogGroupName: /aws-glue/jobs/ObservabilityBlogETL
       RetentionInDays: 30
+
   MWAATaskLogGroup:
     Type: AWS::Logs::LogGroup
+    Metadata:
+      Description: "CloudWatch Logs group for MWAA task execution logs"
     Properties:
       LogGroupName: !Sub '/airflow/${AWS::StackName}-mwaa/Task'
       RetentionInDays: 30
+
   GlueAggJobRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for the Glue aggregation job with scoped S3 access"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1246,6 +1403,8 @@ Resources:
   # ---------------------------------------------------------------------------
   GlueAggScriptUploaderRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for the Lambda that uploads Glue aggregation scripts"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1273,11 +1432,13 @@ Resources:
   # ---------------------------------------------------------------------------
   GlueAggScriptUploaderFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      Description: "Lambda function that uploads the Glue aggregation script to S3"
     Properties:
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt GlueAggScriptUploaderRole.Arn
-      Timeout: 300
+      Timeout: !Ref LambdaTimeout
       Environment:
         Variables:
           SOURCE_BUCKET: !Ref ETLDataBucket
@@ -1474,6 +1635,8 @@ Resources:
   # ---------------------------------------------------------------------------
   GlueAggScriptUploaderResource:
     Type: AWS::CloudFormation::CustomResource
+    Metadata:
+      Description: "Custom resource triggering Glue aggregation script upload"
     Properties:
       ServiceToken: !GetAtt GlueAggScriptUploaderFunction.Arn
       SourceBucket: !Ref ETLDataBucket
@@ -1483,6 +1646,8 @@ Resources:
   # ---------------------------------------------------------------------------
   ObservabilityBlogAggJob:
     Type: AWS::Glue::Job
+    Metadata:
+      Description: "AWS Glue job that computes revenue and profit aggregations"
     DependsOn: GlueAggScriptUploaderResource
     Properties:
       Name: ObservabilityBlogAggregation
@@ -1506,6 +1671,8 @@ Resources:
   # ---------------------------------------------------------------------------
   MWAAServerlessExecutionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM execution role for the MWAA Serverless workflow"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1541,13 +1708,17 @@ Resources:
                   - logs:PutLogEvents
                   - logs:GetLogEvents
                   - logs:DescribeLogGroups
-                Resource: '*'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/mwaa-serverless/*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/mwaa-serverless/*:*'
 
   # ---------------------------------------------------------------------------
   # MWAA Serverless Workflow YAML Uploader Lambda Role
   # ---------------------------------------------------------------------------
   MWAAServerlessYAMLUploaderRole:
     Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for the Lambda that uploads MWAA Serverless workflow YAML"
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1574,11 +1745,13 @@ Resources:
   # ---------------------------------------------------------------------------
   MWAAServerlessYAMLUploaderFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      Description: "Lambda function that uploads the MWAA Serverless workflow definition"
     Properties:
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt MWAAServerlessYAMLUploaderRole.Arn
-      Timeout: 300
+      Timeout: !Ref LambdaTimeout
       Environment:
         Variables:
           SOURCE_BUCKET: !Ref ETLDataBucket
@@ -1642,6 +1815,8 @@ Resources:
   # ---------------------------------------------------------------------------
   MWAAServerlessYAMLUploaderResource:
     Type: AWS::CloudFormation::CustomResource
+    Metadata:
+      Description: "Custom resource triggering the workflow YAML upload"
     Properties:
       ServiceToken: !GetAtt MWAAServerlessYAMLUploaderFunction.Arn
       SourceBucket: !Ref ETLDataBucket
@@ -1651,6 +1826,8 @@ Resources:
   # ---------------------------------------------------------------------------
   MWAAServerlessWorkflow:
     Type: AWS::MWAAServerless::Workflow
+    Metadata:
+      Description: "MWAA Serverless workflow running the aggregation ETL pipeline"
     DependsOn:
       - ObservabilityBlogAggJob
       - MWAAServerlessYAMLUploaderResource
@@ -1669,279 +1846,19 @@ Resources:
   # ---------------------------------------------------------------------------
   MWAAServerlessLogGroup:
     Type: AWS::Logs::LogGroup
+    Metadata:
+      Description: "CloudWatch Logs group for MWAA Serverless workflow execution"
     Properties:
       LogGroupName: !Sub '/aws/mwaa-serverless/${AWS::StackName}-serverless-agg'
       RetentionInDays: 30
+
   GlueAggLogGroup:
     Type: AWS::Logs::LogGroup
+    Metadata:
+      Description: "CloudWatch Logs group for the Glue aggregation job"
     Properties:
       LogGroupName: /aws-glue/jobs/ObservabilityBlogAggregation
       RetentionInDays: 30
-
-  # ===========================================================================
-  # CloudWatch Logs → Lambda → OpenSearch (Subscription Filter Pipeline)
-  # ===========================================================================
-
-  CWLtoOpenSearchRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: OpenSearchWriteAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - es:ESHttpPost
-                  - es:ESHttpPut
-                Resource: !Sub
-                  - 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*'
-                  - DomainName: !ImportValue
-                      Fn::Sub: '${OpenSearchStackName}-OpenSearchDomainName'
-
-  CWLtoOpenSearchFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: CWLtoOpenSearch
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt CWLtoOpenSearchRole.Arn
-      Timeout: 60
-      MemorySize: 256
-      Environment:
-        Variables:
-          OPENSEARCH_ENDPOINT: !Sub
-            - 'https://${Endpoint}'
-            - Endpoint: !ImportValue
-                Fn::Sub: '${OpenSearchStackName}-OpenSearchDomainEndpoint'
-      Code:
-        ZipFile: |
-          import base64
-          import gzip
-          import json
-          import os
-          import datetime
-          from urllib.request import Request, urlopen
-          from urllib.error import HTTPError
-          import boto3
-          from botocore.auth import SigV4Auth
-          from botocore.awsrequest import AWSRequest
-
-          OPENSEARCH_ENDPOINT = os.environ["OPENSEARCH_ENDPOINT"]
-          REGION = os.environ["AWS_REGION"]
-
-          def get_credentials():
-              session = boto3.Session()
-              return session.get_credentials().get_frozen_credentials()
-
-          def sign_request(method, url, body, region, service="es"):
-              creds = get_credentials()
-              request = AWSRequest(method=method, url=url, data=body, headers={"Content-Type": "application/json"})
-              SigV4Auth(creds, service, region).add_auth(request)
-              return dict(request.headers)
-
-          def handler(event, context):
-              compressed = base64.b64decode(event["awslogs"]["data"])
-              payload = json.loads(gzip.decompress(compressed))
-
-              if payload.get("messageType") == "CONTROL_MESSAGE":
-                  return {"statusCode": 200, "body": "Control message ignored"}
-
-              log_group = payload.get("logGroup", "unknown")
-              log_stream = payload.get("logStream", "unknown")
-              log_events = payload.get("logEvents", [])
-
-              if not log_events:
-                  return {"statusCode": 200, "body": "No log events"}
-
-              today = datetime.datetime.utcnow().strftime("%Y.%m.%d")
-              index_name = f"cwl-{today}"
-
-              bulk_body = ""
-              for evt in log_events:
-                  doc = {
-                      "@timestamp": datetime.datetime.utcfromtimestamp(evt["timestamp"] / 1000).isoformat() + "Z",
-                      "message": evt.get("message", ""),
-                      "log_group": log_group,
-                      "log_stream": log_stream,
-                      "id": evt.get("id", "")
-                  }
-                  try:
-                      parsed = json.loads(evt["message"])
-                      if isinstance(parsed, dict):
-                          doc.update(parsed)
-                  except (json.JSONDecodeError, TypeError):
-                      pass
-                  bulk_body += json.dumps({"index": {"_index": index_name}}) + chr(10)
-                  bulk_body += json.dumps(doc) + chr(10)
-
-              url = f"{OPENSEARCH_ENDPOINT}/_bulk"
-              headers = sign_request("POST", url, bulk_body, REGION)
-              req = Request(url, data=bulk_body.encode("utf-8"), headers=headers, method="POST")
-              try:
-                  with urlopen(req) as resp:
-                      response_body = json.loads(resp.read())
-                      if response_body.get("errors"):
-                          print(f"Bulk indexing had errors: {json.dumps(response_body)}")
-                      return {"statusCode": 200, "body": f"Indexed {len(log_events)} events to {index_name}"}
-              except HTTPError as e:
-                  print(f"OpenSearch bulk request failed: {e.code} {e.read().decode()}")
-                  raise
-
-  # --- Lambda Invoke Permissions (one per log group) ---
-  CWLPermissionEC2ETL:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/observability-blog/ec2-etl:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionMWAATask:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/airflow/${AWS::StackName}-mwaa/Task:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionGlueETL:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/ObservabilityBlogETL:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionGlueAgg:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/ObservabilityBlogAggregation:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionGlueError:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/error:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionGlueLogsV2:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/logs-v2:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionMWAAServerless:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/mwaa-serverless/${AWS::StackName}-serverless-agg:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionMWAAScheduler:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-mwaa-Scheduler:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionMWAAWorker:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-mwaa-Worker:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionMWAADAGProcessing:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-mwaa-DAGProcessing:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  CWLPermissionMWAAWebServer:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt CWLtoOpenSearchFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: logs.amazonaws.com
-      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-${AWS::StackName}-mwaa-WebServer:*'
-      SourceAccount: !Ref AWS::AccountId
-
-  # --- Subscription Filters ---
-  SubscriptionFilterEC2ETL:
-    Type: AWS::Logs::SubscriptionFilter
-    DependsOn: CWLPermissionEC2ETL
-    Properties:
-      LogGroupName: !Ref EC2ETLLogGroup
-      FilterName: OpenSearchObservabilityFilter
-      FilterPattern: ''
-      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
-
-  SubscriptionFilterMWAATask:
-    Type: AWS::Logs::SubscriptionFilter
-    DependsOn: [CWLPermissionMWAATask, MWAAEnvironment]
-    Properties:
-      LogGroupName: !Ref MWAATaskLogGroup
-      FilterName: OpenSearchObservabilityFilter
-      FilterPattern: ''
-      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
-
-  SubscriptionFilterGlueETL:
-    Type: AWS::Logs::SubscriptionFilter
-    DependsOn: CWLPermissionGlueETL
-    Properties:
-      LogGroupName: !Ref GlueETLLogGroup
-      FilterName: OpenSearchObservabilityFilter
-      FilterPattern: ''
-      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
-
-  SubscriptionFilterGlueAgg:
-    Type: AWS::Logs::SubscriptionFilter
-    DependsOn: CWLPermissionGlueAgg
-    Properties:
-      LogGroupName: !Ref GlueAggLogGroup
-      FilterName: OpenSearchObservabilityFilter
-      FilterPattern: ''
-      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
-
-  SubscriptionFilterMWAAServerless:
-    Type: AWS::Logs::SubscriptionFilter
-    DependsOn: CWLPermissionMWAAServerless
-    Properties:
-      LogGroupName: !Ref MWAAServerlessLogGroup
-      FilterName: OpenSearchObservabilityFilter
-      FilterPattern: ''
-      DestinationArn: !GetAtt CWLtoOpenSearchFunction.Arn
 
 Outputs:
   GlueJobName:
@@ -1961,6 +1878,7 @@ Outputs:
     Value: !Ref MWAAEnvironment
     Export:
       Name: !Sub '${AWS::StackName}-MWAAEnvironmentName'
+
   ETLDataBucketName:
     Description: S3 bucket name for ETL data and log DLQ
     Value: !Ref ETLDataBucket
