@@ -97,6 +97,16 @@ Parameters:
     MinValue: 30
     MaxValue: 900
 
+  ConfigureXRayTransactionSearch:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether this stack should configure X-Ray Transaction Search (an account-level
+      singleton) and its CloudWatch Logs resource policy. Set to 'false' (default) if
+      Transaction Search is already enabled in the account, otherwise stack creation
+      fails validation because the config already exists.
+
 Conditions:
   CreateCognito: !And
     - !Equals [!Ref OAuthDiscoveryURL, '']
@@ -106,10 +116,12 @@ Conditions:
   CreateExecutionRole: !Equals [!Ref ExecutionRole, '']
   UseImportedOpenSearchEndpoint: !Equals [!Ref AmazonOpenSearchEndpoint, '']
   UseImportedOpenSearchRegion: !Equals [!Ref AmazonOpenSearchRegion, '']
+  ConfigureXRayTransactionSearch: !Equals [!Ref ConfigureXRayTransactionSearch, 'true']
 
 Resources:
   LogsResourcePolicy:
     Type: AWS::Logs::ResourcePolicy
+    Condition: ConfigureXRayTransactionSearch
     Properties:
       PolicyName: TransactionSearchAccess
       PolicyDocument: !Sub >
@@ -146,6 +158,7 @@ Resources:
 
   XRayTransactionSearchConfig:
     Type: AWS::XRay::TransactionSearchConfig
+    Condition: ConfigureXRayTransactionSearch
     DependsOn: LogsResourcePolicy
     Properties:
       IndexingPercentage: 3
