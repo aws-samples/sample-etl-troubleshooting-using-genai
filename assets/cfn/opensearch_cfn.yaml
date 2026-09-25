@@ -38,6 +38,14 @@ Parameters:
     Description: Timeout in seconds for Lambda functions used in custom resources
     MinValue: 30
     MaxValue: 900
+  NotebookGitRepo:
+    Type: String
+    Default: https://github.com/aws-samples/sample-etl-troubleshooting-using-genai.git
+    Description: HTTPS URL of the public git repository that hosts the lab notebook and assets.
+  NotebookGitBranch:
+    Type: String
+    Default: main
+    Description: Branch of NotebookGitRepo to clone onto the notebook instance.
 
 Resources:
 
@@ -63,12 +71,22 @@ Resources:
               Fn::Sub:
                 - |
                   #!/bin/bash
+                  set -eux
                   cd /home/ec2-user/SageMaker
-                  sudo yum install -y awscli zip
-                  curl https://ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0.s3.us-west-2.amazonaws.com/cfda120e-98ef-49df-b875-6f0f33e99615/assets.zip > assets.zip
-                  unzip assets.zip
+                  sudo yum install -y git
+                  # Pull only the lab notebook from the public git repo
+                  # (previously downloaded as assets.zip from a Workshop Studio S3 bucket).
+                  # Use a sparse, shallow, blobless checkout so only the single notebook
+                  # file is fetched rather than the whole repository.
+                  rm -rf /tmp/lab-repo
+                  git clone --depth 1 --branch "${GitBranch}" --filter=blob:none --sparse "${GitRepo}" /tmp/lab-repo
+                  git -C /tmp/lab-repo sparse-checkout set --no-cone assets/Lab-OpenSearch-Observability.ipynb
+                  cp /tmp/lab-repo/assets/Lab-OpenSearch-Observability.ipynb /home/ec2-user/SageMaker/
+                  rm -rf /tmp/lab-repo
+                  sudo chown -R ec2-user:ec2-user /home/ec2-user/SageMaker
                   sudo chmod -R 0777 /home/ec2-user/SageMaker
-                - s3Bucket: !Ref s3BucketHosting
+                - GitRepo: !Ref NotebookGitRepo
+                  GitBranch: !Ref NotebookGitBranch
 
   NotebookInstance:
     Type: AWS::SageMaker::NotebookInstance
@@ -80,7 +98,9 @@ Resources:
       LifecycleConfigName: !GetAtt NotebookInstanceLifecycleConfiguration.NotebookInstanceLifecycleConfigName
       InstanceMetadataServiceConfiguration:
         MinimumInstanceMetadataServiceVersion: "2"
-      PlatformIdentifier: notebook-al2-v2
+      # notebook-al2-v2 (Amazon Linux 2 / JupyterLab 3) is deprecated; new instances
+      # can no longer be created with it. AL2023 is the supported/recommended runtime.
+      PlatformIdentifier: notebook-al2023-v1
 
   AmazonBedrockBatchInfererenceRole:
     Type: AWS::IAM::Role
