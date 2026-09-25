@@ -1,0 +1,967 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for AgentCore MCP Server with optional Cognito authentication'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Required Parameters"
+        Parameters:
+          - MultimodalStackName
+          - AgentCoreMCPServerName
+          - AmazonOpenSearchEndpoint
+          - AmazonOpenSearchRegion
+      - Label:
+          default: "Optional Parameters"
+        Parameters:
+          - ExecutionRole
+          - ECRRepository
+          - OAuthDiscoveryURL
+          - OAuthAllowedClients
+          - OAuthAllowedAudience
+          - LambdaTimeout
+    ParameterLabels:
+      MultimodalStackName:
+        default: "Multimodal Stack Name"
+      AmazonOpenSearchEndpoint:
+        default: "Amazon OpenSearch Endpoint"
+      AmazonOpenSearchRegion:
+        default: "OpenSearch Region"
+      AgentCoreMCPServerName:
+        default: "MCP Server Name"
+      ExecutionRole:
+        default: "Execution Role ARN (Optional)"
+      ECRRepository:
+        default: "ECR Repository URI (Optional)"
+      OAuthDiscoveryURL:
+        default: "OAuth Discovery URL (Optional)"
+      OAuthAllowedClients:
+        default: "Allowed Client IDs (Optional)"
+      OAuthAllowedAudience:
+        default: "Allowed Audiences (Optional)"
+      LambdaTimeout:
+        default: "Lambda Timeout (Optional)"
+
+Parameters:
+  MultimodalStackName:
+    Type: String
+    Description: Name of the multimodal CloudFormation stack that contains the OpenSearch domain
+    Default: opensearch-cfn
+    
+  AgentCoreMCPServerName:
+    Type: String
+    Description: Name of the MCP server. The final AgentCore Runtime name will have a unique ID appended to this name. Maximum 35 characters.
+    Default: opensearch_mcp_server
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9_]{0,34}"
+    ConstraintDescription: "Must start with a letter and contain only letters, numbers, and underscores. Maximum 35 characters."
+  
+  AmazonOpenSearchEndpoint:
+    Type: String
+    Description: "The endpoint of the Amazon OpenSearch Service. Leave blank to auto-import from multimodal stack."
+    Default: ""
+
+  AmazonOpenSearchRegion:
+    Type: String
+    Description: "AWS region where the OpenSearch cluster is located. Leave blank to auto-import from multimodal stack."
+    Default: ""
+
+  ExecutionRole:
+    Type: String
+    Description: Bedrock AgentCore execution role ARN. If left blank, a new role with the necessary permissions will be created. You will need to map the created role to a backend role of the OpenSearch domain.
+    Default: ''
+  
+  ECRRepository:
+    Type: String
+    Description: ECR repository URI where the container image of the MCP server will be stored. If left blank, a new ECR repository will be created.
+    Default: ''
+  
+  OAuthDiscoveryURL:
+    Type: String
+    Description: "OAuth2 discovery URL. Example: https://example.us-east-1.amazonaws.com/example/.well-known/openid-configuration. If left blank, a new Cognito user pool will be created."
+    Default: ''
+  
+  OAuthAllowedClients:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of allowed client IDs.
+    Default: ''
+  
+  OAuthAllowedAudience:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of allowed audiences.
+    Default: ''
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: Timeout in seconds for Lambda functions used in custom resources
+    MinValue: 30
+    MaxValue: 900
+
+  ConfigureXRayTransactionSearch:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether this stack should configure X-Ray Transaction Search (an account-level
+      singleton) and its CloudWatch Logs resource policy. Set to 'false' (default) if
+      Transaction Search is already enabled in the account, otherwise stack creation
+      fails validation because the config already exists.
+
+Conditions:
+  CreateCognito: !And
+    - !Equals [!Ref OAuthDiscoveryURL, '']
+    - !Equals [!Join ['', !Ref OAuthAllowedClients], '']
+    - !Equals [!Join ['', !Ref OAuthAllowedAudience], '']
+  CreateECRRepository: !Equals [!Ref ECRRepository, '']
+  CreateExecutionRole: !Equals [!Ref ExecutionRole, '']
+  UseImportedOpenSearchEndpoint: !Equals [!Ref AmazonOpenSearchEndpoint, '']
+  UseImportedOpenSearchRegion: !Equals [!Ref AmazonOpenSearchRegion, '']
+  ConfigureXRayTransactionSearch: !Equals [!Ref ConfigureXRayTransactionSearch, 'true']
+
+Resources:
+  LogsResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Condition: ConfigureXRayTransactionSearch
+    Properties:
+      PolicyName: TransactionSearchAccess
+      PolicyDocument: !Sub >
+        {
+          "Version": "2012-10-17",		 	 	 
+          "Statement": [
+            {
+              "Sid": "TransactionSearchXRayAccess",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "xray.amazonaws.com"
+              },
+              "Action": [
+                "logs:PutLogEvents",
+                "logs:CreateLogStream"
+              ],
+              "Resource": [
+                "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*",
+                "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*"
+              ],
+              "Condition": {
+                "ArnLike": {
+                  "aws:SourceArn": "arn:${AWS::Partition}:xray:${AWS::Region}:${AWS::AccountId}:*"
+                },
+                "StringEquals": {
+                  "aws:SourceAccount": "${AWS::AccountId}"
+                }
+              }
+            }
+          ]
+        }
+    Metadata:
+      Description: "CloudWatch Logs resource policy granting X-Ray access for transaction search"
+
+  XRayTransactionSearchConfig:
+    Type: AWS::XRay::TransactionSearchConfig
+    Condition: ConfigureXRayTransactionSearch
+    DependsOn: LogsResourcePolicy
+    Properties:
+      IndexingPercentage: 3
+    Metadata:
+      Description: "X-Ray transaction search configuration for distributed tracing"
+  
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: CreateCognito
+    Properties:
+      UserPoolName: !Sub 
+        - '${AgentCoreMCPServerName}-user-pool-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: false
+          RequireLowercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+    Metadata:
+      Description: "Cognito user pool for MCP server OAuth authentication"
+
+  CognitoUserPoolResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Condition: CreateCognito
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Identifier: !Sub 
+        - '${AgentCoreMCPServerName}_${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Name: !Sub 
+        - '${AgentCoreMCPServerName} Resource Server ${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Scopes:
+        - ScopeName: invoke
+          ScopeDescription: Invoke MCP server
+    Metadata:
+      Description: "Cognito resource server defining MCP invoke scope"
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: CreateCognito
+    DependsOn: CognitoUserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: !Sub 
+        - '${AgentCoreMCPServerName}-client-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub 
+          - '${AgentCoreMCPServerName}_${StackId}/invoke'
+          - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+    Metadata:
+      Description: "Cognito app client for MCP server client credentials flow"
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Condition: CreateCognito
+    Properties:
+      Domain: !Sub 
+        - 'opensearch-mcp-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      UserPoolId: !Ref CognitoUserPool
+    Metadata:
+      Description: "Cognito hosted UI domain for token endpoint"
+
+  CognitoSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateCognito
+    Properties:
+      Name: !Sub 
+        - 'CognitoSecret-${AgentCoreMCPServerName}-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Description: Cognito client ID and secret
+      SecretString: !Sub 
+        - '{ "clientId" : "${ClientId}", "clientSecret" : "${ClientSecret}" }'
+        - ClientId: !Ref CognitoUserPoolClient
+          ClientSecret: !GetAtt CognitoUserPoolClient.ClientSecret
+    Metadata:
+      Description: "Secrets Manager secret storing Cognito client ID and secret"
+
+  AgentECRRepository:
+    Type: AWS::ECR::Repository
+    Condition: CreateECRRepository
+    Properties:
+      RepositoryName: !Sub 
+        - '${AgentCoreMCPServerName}-ecr-repo-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      EmptyOnDelete: true
+    Metadata:
+      Description: "ECR repository for the MCP server container image"
+
+  AgentExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRole
+    Properties:
+      RoleName: !Sub 
+        - '${AgentCoreMCPServerName}-execution-role-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AssumeRolePolicy
+            Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*'
+      Policies:
+        - PolicyName: AgentCoreExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ECRImageAccess
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource:
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*'
+              - Sid: ECRTokenAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+              - Effect: Allow
+                Resource: '*'
+                Action: cloudwatch:PutMetricData
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': bedrock-agentcore
+              - Sid: GetAgentAccessToken
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+                  - !Sub 
+                    - 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${AgentCoreMCPServerName}_${StackId}-*'
+                    - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+              - Sid: BedrockModelInvocation
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*'
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"                  
+                  - !Sub "arn:aws:bedrock:us-east-1::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:us-east-1:${AWS::AccountId}:inference-profile/*"                  
+                  - !Sub "arn:aws:bedrock:us-east-2::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:us-east-2:${AWS::AccountId}:inference-profile/*"                  
+                  - !Sub "arn:aws:bedrock:us-west-1::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:us-west-1:${AWS::AccountId}:inference-profile/*"    
+        - PolicyName: AgentCoreMarketSubscription
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MarketplaceOperationsFromBedrockFor3pModels
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Unsubscribe
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    'aws:CalledViaLast': 'bedrock.amazonaws.com'
+    Metadata:
+      Description: "IAM execution role for the Bedrock AgentCore runtime"
+      checkov:
+        skip:
+          - id: CKV_AWS_107
+            comment: "ecr:GetAuthorizationToken requires Resource:* per AWS documentation"
+          - id: CKV_AWS_111
+            comment: "xray:PutTraceSegments and cloudwatch:PutMetricData do not support resource-level permissions"
+
+  HelperLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for the helper Lambda that manages S3 staging bucket"
+      checkov:
+        skip:
+          - id: CKV_AWS_108
+            comment: "S3 access scoped to agentcore-mcp bucket pattern; required for staging artifacts"
+          - id: CKV_AWS_109
+            comment: "iam:PassRole scoped to stack-specific role names"
+    Properties:
+      RoleName: !Sub 
+        - '${AgentCoreMCPServerName}-helper-role-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HelperLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                  - s3:DeleteBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::agentcore-mcp-${AWS::AccountId}-*'
+                  - !Sub 'arn:aws:s3:::agentcore-mcp-${AWS::AccountId}-*/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AgentCoreMCPServerName}-*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+        - PolicyName: AgentCoreMarketSubscription
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MarketplaceOperationsFromBedrockFor3pModels
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Unsubscribe
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    'aws:CalledViaLast': 'bedrock.amazonaws.com'
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Description: "IAM role for CodeBuild project that builds and deploys the MCP server"
+      checkov:
+        skip:
+          - id: CKV_AWS_107
+            comment: "ecr:GetAuthorizationToken requires Resource:* per AWS documentation"
+          - id: CKV_AWS_108
+            comment: "ECR and S3 access scoped to account-specific repositories and buckets"
+          - id: CKV_AWS_109
+            comment: "iam:PassRole scoped to stack-specific roles; CreateServiceLinkedRole conditioned on service name"
+          - id: CKV_AWS_111
+            comment: "bedrock-agentcore write actions scoped to account/region ARN"
+    Properties:
+      RoleName: !Sub 
+        - '${AgentCoreMCPServerName}-codebuild-role-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+        - PolicyName: BedrockAgentCorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AgentCoreOperations
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateAgentRuntime
+                  - bedrock-agentcore:UpdateAgentRuntime
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:CreateAgentRuntimeEndpoint
+                  - bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                  - bedrock-agentcore:GetAgentRuntimeEndpoint
+                  - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:CreateWorkloadIdentity
+                  - bedrock-agentcore:GetWorkloadIdentity
+                  - bedrock-agentcore:DeleteWorkloadIdentity
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: PassExecutionRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - iam:GetRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AgentCoreMCPServerName}-*'
+              - Sid: CreateServiceLinkedRole
+                Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+        - PolicyName: S3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 
+                  - 'arn:aws:s3:::${S3Bucket}/*'
+                  - S3Bucket: !Sub 
+                    - 'agentcore-mcp-${AWS::AccountId}-${StackId}'
+                    - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+        - PolicyName: ECRPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                  - ecr:ListImages
+                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+        - PolicyName: AgentCoreMarketSubscription
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MarketplaceOperationsFromBedrockFor3pModels
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Unsubscribe
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    'aws:CalledViaLast': 'bedrock.amazonaws.com'
+        - PolicyName: AdditionalPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AgentCoreMCPServerName}-*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:OpenSearchSecret-*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:CognitoSecret-*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackResources
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${MultimodalStackName}/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+
+  AgentCoreLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 
+        - '${AgentCoreMCPServerName}-lambda-role-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAgentCorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:DeleteAgentRuntime
+                  - bedrock-agentcore:DeleteAgentRuntimeEndpoint
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:DeleteWorkloadIdentity
+                  - bedrock-agentcore:GetWorkloadIdentity
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AgentCoreMCPServerName}-*'
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt CodeBuildProject.Arn
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:GetLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+        - PolicyName: AgentCoreMarketSubscription
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MarketplaceOperationsFromBedrockFor3pModels
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Unsubscribe
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    'aws:CalledViaLast': 'bedrock.amazonaws.com'
+    Metadata:
+      Description: "IAM role for the AgentCore orchestration Lambda"
+      checkov:
+        skip:
+          - id: CKV_AWS_109
+            comment: "iam:PassRole scoped to stack-specific role names; bedrock-agentcore delete requires Resource:*"
+
+  HelperLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 
+        - '${AgentCoreMCPServerName}-helper-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt HelperLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import urllib.request
+          import json
+          
+          def lambda_handler(event, context):
+              print("event: " + str(event))
+              request_type = event['RequestType']
+              
+              if request_type == 'Update':
+                  return respond_success(event, context)
+              
+              if request_type == 'Delete' or event['ResourceProperties'].get('CleanupS3Bucket') == 'true':
+                  clean_s3_bucket(event['ResourceProperties']['S3Bucket'])
+                  return respond_success(event, context)
+              
+              return download_and_upload_lambda(event, context)
+          
+          def download_and_upload_lambda(event, context):
+              response_data = {'ContinuedInvoke': True}
+              try:
+                  source_url = event['ResourceProperties']['SourceUrl']
+                  s3_key = event['ResourceProperties']['S3Key']
+                  tmp_file_path = f"/tmp/{s3_key}"
+                  
+                  download_from_url(source_url, tmp_file_path)
+                  bucket_name = event['ResourceProperties']['S3Bucket']
+                  create_s3_bucket(bucket_name)
+                  upload_file_to_s3(bucket_name, s3_key, tmp_file_path)
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, context.log_stream_name)
+                  return {"statusCode": 200}
+              except Exception as e:
+                  print(e)
+                  response_data['ContinuedInvoke'] = False
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data, context.log_stream_name)
+                  return {"statusCode": 500}
+          
+          def download_from_url(url, file_path):
+              urllib.request.urlretrieve(url, file_path)
+              print(f"Downloaded file from {url} to {file_path}")
+          
+          def create_s3_bucket(bucket_name):
+              s3 = boto3.client('s3')
+              region = boto3.session.Session().region_name
+              if region == 'us-east-1':
+                  s3.create_bucket(Bucket=bucket_name)
+              else:
+                  s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={'LocationConstraint': region})
+              print(f"S3 bucket {bucket_name} created successfully")
+          
+          def upload_file_to_s3(bucket_name, s3_key, file_path):
+              s3 = boto3.resource('s3')
+              s3.Bucket(bucket_name).upload_file(file_path, s3_key)
+              print(f"Uploaded file to s3://{bucket_name}/{s3_key}")
+          
+          def respond_success(event, context):
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, context.log_stream_name)
+              return {"statusCode": 200}
+          
+          def clean_s3_bucket(bucket_name):
+              try:
+                  s3 = boto3.resource('s3')
+                  bucket = s3.Bucket(bucket_name)
+                  bucket.objects.all().delete()
+                  bucket.delete()
+                  print(f"S3 bucket {bucket_name} deleted successfully")
+              except Exception as e:
+                  print(f"S3 bucket {bucket_name} does not exist or error: {e}")
+    Metadata:
+      Description: "Lambda function that downloads MCP server artifacts and stages them in S3"
+
+  SLRCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 
+        - '${AgentCoreMCPServerName}-slr-creator-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt HelperLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              iam = boto3.client('iam')
+              try:
+                  iam.create_service_linked_role(AWSServiceName='bedrock-agentcore.amazonaws.com')
+                  print("Created SLR for bedrock-agentcore.amazonaws.com")
+              except Exception as e:
+                  print(f"SLR creation result: {e}")
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  SLRCreatorInvoke:
+    Type: Custom::SLRCreator
+    DependsOn: SLRCreatorFunction
+    Properties:
+      ServiceToken: !GetAtt SLRCreatorFunction.Arn
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: [HelperLambdaInvoke, SLRCreatorInvoke]
+    Properties:
+      Name: !Sub 
+        - '${AgentCoreMCPServerName}-codebuild-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+      Source:
+        Type: S3
+        Location: !Sub 
+          - '${S3Bucket}/opensearch-agentcore-mcp-server.zip'
+          - S3Bucket: !Sub 
+            - 'agentcore-mcp-${AWS::AccountId}-${StackId}'
+            - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.12
+              commands:
+                - echo "Installing bedrock-agentcore-starter-toolkit..."
+                - pip install bedrock-agentcore-starter-toolkit
+                - echo "Installation complete"
+            pre_build:
+              commands:
+                - echo "Pre-build phase - checking environment..."
+                - aws --version
+                - python --version
+                - ls -la
+                - echo "Environment variables:"
+                - env | grep -E "(AWS_|CODEBUILD_)"
+                - echo "Checking marketplace subscriptions..."
+                - aws marketplace view-subscriptions --region ${AWS::Region} || echo "No subscriptions found"
+            build:
+              commands:
+                - echo "Starting build phase..."
+                - echo "Running codebuild_launch.py..."
+                - python codebuild_launch.py
+            post_build:
+              commands:
+                - echo "Build completed"
+    Metadata:
+      Description: "CodeBuild project that builds the MCP server container and deploys to AgentCore"
+
+  HelperLambdaInvoke:
+    Type: Custom::InvokeLambda
+    Properties:
+      ServiceToken: !GetAtt HelperLambdaFunction.Arn
+      SourceUrl: "https://d2wvpdb2jzk602.cloudfront.net/opensearch-agentcore-mcp-server.zip"
+      S3Bucket: !Sub 
+        - 'agentcore-mcp-${AWS::AccountId}-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      S3Key: opensearch-agentcore-mcp-server.zip
+      CleanupS3Bucket: false
+    Metadata:
+      Description: "Custom resource that triggers the helper Lambda to stage artifacts"
+
+  AgentCoreLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [HelperLambdaInvoke]
+    Properties:
+      FunctionName: !Sub 
+        - '${AgentCoreMCPServerName}-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt AgentCoreLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Architectures:
+        - arm64
+      LoggingConfig:
+        ApplicationLogLevel: INFO
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Sub 
+          - 'agentcore-mcp-${AWS::AccountId}-${StackId}'
+          - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+        S3Key: opensearch-agentcore-mcp-server.zip
+      Environment:
+        Variables:
+          AGENT_NAME: !Sub 
+            - '${AgentCoreMCPServerName}_${StackId}'
+            - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+          EXECUTION_ROLE: !If
+            - CreateExecutionRole
+            - !GetAtt AgentExecutionRole.Arn
+            - !Ref ExecutionRole
+          ECR_REPOSITORY: !If
+            - CreateECRRepository
+            - !GetAtt AgentECRRepository.RepositoryUri
+            - !Ref ECRRepository
+          OPENSEARCH_URL: !If
+            - UseImportedOpenSearchEndpoint
+            - !Sub 
+              - "https://${OpenSearchEndpoint}"
+              - OpenSearchEndpoint: !ImportValue 
+                  Fn::Sub: "${MultimodalStackName}-OpenSearchDomainEndpoint"
+            - !Ref AmazonOpenSearchEndpoint
+          DISCOVERY_URL: !If
+            - CreateCognito
+            - !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/openid-configuration'
+            - !Ref OAuthDiscoveryURL
+          ALLOWED_CLIENTS: !If
+            - CreateCognito
+            - !Ref CognitoUserPoolClient
+            - !Join [',', !Ref OAuthAllowedClients]
+          ALLOWED_AUDIENCE: !Join [',', !Ref OAuthAllowedAudience]
+          CODEBUILD_PROJECT: !Ref CodeBuildProject
+          AGENTCORE_REGION: !Ref AWS::Region
+          OPENSEARCH_REGION: !If
+            - UseImportedOpenSearchRegion
+            - !ImportValue 
+                Fn::Sub: "${MultimodalStackName}-Region"
+            - !Ref AmazonOpenSearchRegion
+    Metadata:
+      Description: "Lambda function that orchestrates AgentCore runtime creation via CodeBuild"
+
+  AgentCoreSetup:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: [AgentCoreLambdaFunction]
+    Properties:
+      ServiceToken: !GetAtt AgentCoreLambdaFunction.Arn
+      AgentName: !Ref AgentCoreMCPServerName
+      ExecutionRole: !If
+        - CreateExecutionRole
+        - !GetAtt AgentExecutionRole.Arn
+        - !Ref ExecutionRole
+      ECRRepository: !If
+        - CreateECRRepository
+        - !GetAtt AgentECRRepository.RepositoryUri
+        - !Ref ECRRepository
+      OpenSearchUrl: !If
+        - UseImportedOpenSearchEndpoint
+        - !Sub 
+          - "https://${OpenSearchEndpoint}"
+          - OpenSearchEndpoint: !ImportValue 
+              Fn::Sub: "${MultimodalStackName}-OpenSearchDomainEndpoint"
+        - !Ref AmazonOpenSearchEndpoint
+      DiscoveryUrl: !If
+        - CreateCognito
+        - !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/openid-configuration'
+        - !Ref OAuthDiscoveryURL
+      AllowedClients: !If
+        - CreateCognito
+        - !Ref CognitoUserPoolClient
+        - !Join [',', !Ref OAuthAllowedClients]
+      AllowedAudience: !Join [',', !Ref OAuthAllowedAudience]
+    Metadata:
+      Description: "Custom resource that triggers the AgentCore deployment pipeline"
+
+  CleanupS3Bucket:
+    Type: Custom::InvokeLambda
+    DependsOn: [AgentCoreSetup]
+    Properties:
+      ServiceToken: !GetAtt HelperLambdaFunction.Arn
+      CleanupS3Bucket: true
+      S3Bucket: !Sub 
+        - 'agentcore-mcp-${AWS::AccountId}-${StackId}'
+        - StackId: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+    Metadata:
+      Description: "Custom resource that cleans up the S3 staging bucket after deployment"
+
+Outputs:
+  AgentExecutionRoleArn:
+    Description: ARN of the Agent Execution Role
+    Value: !If
+      - CreateExecutionRole
+      - !GetAtt AgentExecutionRole.Arn
+      - !Ref ExecutionRole
+  
+  AgentCoreArn:
+    Description: ARN of the created agent.
+    Value: !GetAtt AgentCoreSetup.AgentCoreArn
+  
+  MCPServerEndpoint:
+    Description: MCP server URL for the agent.
+    Value: !GetAtt AgentCoreSetup.McpUrl
+  
+  TokenEndpoint:
+    Description: |
+      OAuth token endpoint. Example cURL command to get token: curl --http1.1 -X POST <TOKEN_ENDPOINT> -H "Content-Type: application/x-www-form-urlencoded" -d "grant_type=client_credentials&client_id=<CLIENT_ID>&client_secret=<CLIENT_SECRET>"
+    Value: !GetAtt AgentCoreSetup.TokenEndpoint
+
+  CognitoSecret:
+    Condition: CreateCognito
+    Description: Name of the Cognito secret in Secrets Manager containing client ID and secret
+    Value: !Ref CognitoSecret

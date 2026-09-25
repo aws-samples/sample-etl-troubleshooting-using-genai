@@ -1,0 +1,516 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to provision OpenSearch cluster and SageMaker Notebook for Analytics Observability
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required Parameters
+        Parameters:
+          - OpenSearchUsername
+          - OpenSearchPassword
+    ParameterLabels:
+      OpenSearchUsername:
+        default: OpenSearch cluster username
+      OpenSearchPassword:
+        default: OpenSearch cluster password
+      SageMakerNotebookName:
+        default: Name of SageMaker Notebook Instance
+      
+Parameters:
+  OpenSearchUsername:
+    AllowedPattern: '^[a-zA-Z0-9]+$'
+    Default: admin
+    Description: User name for the account that will be added to the OpenSearch cluster.
+    MaxLength: '25'
+    MinLength: '5'
+    Type: String
+  OpenSearchPassword:
+    AllowedPattern: '(?=^.{8,32}$)((?=.*\d)(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[^A-Za-z0-9])(?=.*[a-z])|(?=.*[^A-Za-z0-9])(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[A-Z])(?=.*[^A-Za-z0-9]))^.*'
+    Description: Password for the account named above. Must be 8-32 characters containing letters, numbers and symbols. No default is provided; you must supply a value at deploy time.
+    MaxLength: '32'
+    MinLength: '8'
+    NoEcho: 'true'
+    Type: String
+  LambdaTimeout:
+    Type: Number
+    Default: 120
+    Description: Timeout in seconds for Lambda functions used in custom resources
+    MinValue: 30
+    MaxValue: 900
+  NotebookGitRepo:
+    Type: String
+    Default: https://github.com/aws-samples/sample-etl-troubleshooting-using-genai.git
+    Description: HTTPS URL of the public git repository that hosts the lab notebook and assets.
+  NotebookGitBranch:
+    Type: String
+    Default: main
+    Description: Branch of NotebookGitRepo to clone onto the notebook instance.
+
+Resources:
+
+  OpenSearchSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: []
+    Properties:
+      Name: !Sub OpenSearchSecret-${AWS::StackName}
+      Description: OpenSearch admin username and password stored for programmatic access
+
+      SecretString: !Sub '{ "username" : "${OpenSearchUsername}", "password" : "${OpenSearchPassword}" }'
+
+  NotebookInstanceLifecycleConfiguration:
+    Type: AWS::SageMaker::NotebookInstanceLifecycleConfig
+    Properties:
+      NotebookInstanceLifecycleConfigName: webapp-app-launch
+      OnStart: 
+        - Content:
+            Fn::Base64: 
+              Fn::Sub:
+                - |
+                  #!/bin/bash
+                  set -eux
+                  cd /home/ec2-user/SageMaker
+                  sudo yum install -y git
+                  # Pull only the lab notebook from the public git repo
+                  # (previously downloaded as assets.zip from a Workshop Studio S3 bucket).
+                  # Use a sparse, shallow, blobless checkout so only the single notebook
+                  # file is fetched rather than the whole repository.
+                  rm -rf /tmp/lab-repo
+                  git clone --depth 1 --branch "${GitBranch}" --filter=blob:none --sparse "${GitRepo}" /tmp/lab-repo
+                  git -C /tmp/lab-repo sparse-checkout set --no-cone assets/Lab-OpenSearch-Observability.ipynb
+                  cp /tmp/lab-repo/assets/Lab-OpenSearch-Observability.ipynb /home/ec2-user/SageMaker/
+                  rm -rf /tmp/lab-repo
+                  sudo chown -R ec2-user:ec2-user /home/ec2-user/SageMaker
+                  sudo chmod -R 0777 /home/ec2-user/SageMaker
+                - GitRepo: !Ref NotebookGitRepo
+                  GitBranch: !Ref NotebookGitBranch
+
+  NotebookInstance:
+    Type: AWS::SageMaker::NotebookInstance
+    Properties:
+      NotebookInstanceName: semantic-search-nb
+      InstanceType: ml.m5d.2xlarge
+      RoleArn: !GetAtt NBRole.Arn
+      VolumeSizeInGB : 200
+      LifecycleConfigName: !GetAtt NotebookInstanceLifecycleConfiguration.NotebookInstanceLifecycleConfigName
+      InstanceMetadataServiceConfiguration:
+        MinimumInstanceMetadataServiceVersion: "2"
+      # notebook-al2-v2 (Amazon Linux 2 / JupyterLab 3) is deprecated; new instances
+      # can no longer be created with it. AL2023 is the supported/recommended runtime.
+      PlatformIdentifier: notebook-al2023-v1
+
+  AmazonBedrockBatchInfererenceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role assumed by OpenSearch and Bedrock services for batch inference and model invocation
+      Policies:
+        - PolicyName: BedrockTrust
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "es:ESHttp*"
+                Resource:
+                  - !GetAtt OpenSearchServiceDomain.Arn
+                  - !Sub '${OpenSearchServiceDomain.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !GetAtt s3BucketTraining.Arn
+                  - !Sub '${s3BucketTraining.Arn}/*'
+                  - !GetAtt s3BucketHosting.Arn
+                  - !Sub '${s3BucketHosting.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource:
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'                  
+                  - !Sub 'arn:aws:bedrock:us-east-1::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:us-east-1:${AWS::AccountId}:inference-profile/*'                  
+                  - !Sub 'arn:aws:bedrock:us-east-2::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:us-east-2:${AWS::AccountId}:inference-profile/*'                  
+                  - !Sub 'arn:aws:bedrock:us-west-1::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:us-west-1:${AWS::AccountId}:inference-profile/*'    
+              - Effect: Allow
+                Action:
+                  - 'bedrock:ListFoundationModels'
+                Resource: '*'
+        - PolicyName: AgentCoreMarketSubscription
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MarketplaceOperationsFromBedrockFor3pModels
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Unsubscribe
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    'aws:CalledViaLast': 'bedrock.amazonaws.com'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - opensearchservice.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+              ArnEquals:
+                aws:SourceArn:
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-invocation-job/*
+      
+  NBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role for the SageMaker notebook instance with scoped access to OpenSearch, S3, Bedrock, and Secrets Manager
+      Policies:
+        - PolicyName: CustomNotebookAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: OpenSearchAccess
+                Effect: Allow
+                Action:
+                  - "es:ESHttp*"
+                Resource:
+                  - !GetAtt OpenSearchServiceDomain.Arn
+                  - !Sub '${OpenSearchServiceDomain.Arn}/*'
+              - Sid: S3DataAccess
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !GetAtt s3BucketTraining.Arn
+                  - !Sub '${s3BucketTraining.Arn}/*'
+                  - !GetAtt s3BucketHosting.Arn
+                  - !Sub '${s3BucketHosting.Arn}/*'
+              - Sid: BedrockModelInvocation
+                Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource:
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+              - Sid: BedrockListModels
+                Effect: Allow
+                Action:
+                  - 'bedrock:ListFoundationModels'
+                Resource: '*'
+              - Sid: SecretsManagerAccess
+                Effect: Allow
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                Resource:
+                  - !Ref OpenSearchSecret
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:CognitoSecret-*'
+              - Sid: PassBedrockRole
+                Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                  - "sts:AssumeRole"
+                Resource:
+                  - !GetAtt AmazonBedrockBatchInfererenceRole.Arn
+        - PolicyName: WorkshopNotebookAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:PutSubscriptionFilter
+                  - logs:DescribeSubscriptionFilters
+                  - logs:DeleteSubscriptionFilter
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:*'
+              - Sid: LambdaManagement
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:GetPolicy
+                  - lambda:DeleteFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:CWLtoOpenSearch'
+              - Sid: IAMRoleManagement
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                  - iam:DeleteRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/CWLtoOpenSearchLambdaRole'
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              - Sid: CloudFormationRead
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStacks
+                Resource: '*'
+              - Sid: STSIdentity
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              - Sid: MWAAAccess
+                Effect: Allow
+                Action:
+                  - airflow:CreateCliToken
+                Resource:
+                  - !Sub 'arn:aws:airflow:${AWS::Region}:${AWS::AccountId}:environment/*'
+        - PolicyName: AgentCoreMarketSubscription
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MarketplaceOperationsFromBedrockFor3pModels
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Unsubscribe
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    'aws:CalledViaLast': 'bedrock.amazonaws.com'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCloudFormationReadOnlyAccess
+        - arn:aws:iam::aws:policy/TranslateReadOnly
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - sagemaker.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  s3AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  s3AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref s3AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${s3AccessLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  s3BucketTraining:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref s3AccessLogsBucket
+        LogFilePrefix: training/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  s3BucketHosting:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref s3AccessLogsBucket
+        LogFilePrefix: hosting/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  OpenSearchServiceDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      # With FGAC enabled, the resource-based policy is set to open access.
+      # All authorization is handled by OpenSearch's internal security plugin
+      # (fine-grained access control via internal users and backend roles).
+      AccessPolicies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/*/*'
+      EngineVersion: 'OpenSearch_3.5'
+      ClusterConfig:
+        InstanceType: "r6g.2xlarge.search"
+      EBSOptions:
+        EBSEnabled: True
+        VolumeSize: 20
+        VolumeType: 'gp3'
+      # FGAC requires encryption at rest, node-to-node encryption, and HTTPS.
+      AdvancedSecurityOptions:
+        AnonymousAuthEnabled: False
+        Enabled: True
+        InternalUserDatabaseEnabled: True
+        MasterUserOptions:
+          MasterUserName: !Sub ${OpenSearchUsername}
+          MasterUserPassword: !Sub ${OpenSearchPassword}
+      NodeToNodeEncryptionOptions:
+        Enabled: True
+      EncryptionAtRestOptions:
+        Enabled: True
+        KmsKeyId: alias/aws/es
+      DomainEndpointOptions:
+        EnforceHTTPS: True
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+
+Outputs:
+
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch domain endpoint
+    Value:
+      'Fn::GetAtt':
+        - OpenSearchServiceDomain
+        - DomainEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-OpenSearchDomainEndpoint"
+
+  OpenSearchDomainName:
+    Description: OpenSearch domain name
+    Value: !Ref OpenSearchServiceDomain
+
+  OpenSearchDashboardURL:
+    Description: OpenSearch Dashboards URL for browser access
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !GetAtt OpenSearchServiceDomain.DomainEndpoint
+        - '/_dashboards'
+
+  Region:
+    Description: Deployed Region
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+
+  s3BucketTraining:
+    Description: S3 bucket name for training data
+    Value: !Ref s3BucketTraining
+
+  s3BucketHostingBucketName:
+    Description: S3 bucket name for frontend hosting
+    Value: !Ref s3BucketHosting
+
+  S3BucketSecureURL:
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !GetAtt
+          - s3BucketHosting
+          - DomainName
+    Description: Name of S3 bucket to hold website content
+
+  SageMakerNotebookURL:
+    Description: SageMaker Notebook Instance
+    Value: !Join
+      - ''
+      - - 'https://console.aws.amazon.com/sagemaker/home?region='
+        - !Ref AWS::Region
+        - '#/notebook-instances/openNotebook/'
+        - !GetAtt NotebookInstance.NotebookInstanceName
+        - '?view=lab'
+
+  OpenSearchSecret:
+    Description: Name of the OpenSearch secret in Secrets Manager
+    Value: !Ref OpenSearchSecret
+
+  BedrockBatchInferenceRole:
+    Description: Bedrock batch inference role
+    Value: !Ref AmazonBedrockBatchInfererenceRole
+
+  BedrockBatchInferenceRoleArn:
+    Description: Bedrock batch inference role ARN
+    Value: !GetAtt AmazonBedrockBatchInfererenceRole.Arn
+
+  NotebookRole:
+    Description: Sagemaker notebook instance role
+    Value: !Ref NBRole
+
+  NotebookRoleArn:
+    Description: Sagemaker Notebook instance role ARN
+    Value: !GetAtt NBRole.Arn
