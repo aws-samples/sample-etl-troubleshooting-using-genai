@@ -292,7 +292,7 @@ The AgentCore-hosted server is the primary path used in the workshop. If you als
   "mcpServers": {
     "opensearch-mcp": {
       "command": "uvx",
-      "args": ["opensearch-mcp-server-py@latest"],
+      "args": ["opensearch-mcp-server-py>=0.12.0"],
       "env": {
         "OPENSEARCH_URL": "https://YOUR-OPENSEARCH-ENDPOINT",
         "AWS_REGION": "us-east-1",
@@ -312,6 +312,10 @@ The AgentCore-hosted server is the primary path used in the workshop. If you als
 ```
 
 Replace `YOUR-OPENSEARCH-ENDPOINT` with your domain endpoint and configure the authentication that matches your domain's FGAC settings.
+
+> **Version compatibility note.** Always pin `opensearch-mcp-server-py` to a version (for example `>=0.12.0`) rather than using `@latest` or leaving it unpinned. The server depends on the `mcp` Python SDK, and the SDK's 2.x release changed the low-level server API in a breaking way. An unpinned install can pair an older server build with a newer SDK and crash on startup with `AttributeError: 'Server' object has no attribute 'list_tools'`. `opensearch-mcp-server-py>=0.12.0` targets the `mcp` 2.x API and resolves a compatible SDK. The workshop notebook pins this version in the local (Option A) MCP client cell for the same reason.
+>
+> The AgentCore-hosted server (Stack 2, Option B) builds its runtime image from an upstream package archive maintained by the OpenSearch project. If that archive's dependencies drift, the AgentCore runtime can hit the same startup error; the local `uvx` path above is the reliable fallback while you wait for an upstream fix (or redeploy Stack 2 once upstream is healthy).
 
 ### Example Natural Language Queries
 
